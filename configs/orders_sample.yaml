@@ -1,4 +1,4 @@
-entity: orders
+entity: orders_sample
 
 fields:
   order_id:
