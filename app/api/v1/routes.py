@@ -19,7 +19,7 @@ from __future__ import annotations
 import random
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Body, Depends, Query, Request
+from fastapi import APIRouter, Body, Depends, Query, Request, Response
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -79,11 +79,27 @@ _SHOWN_ONCE = "Store this key now: it is shown once, and only a hash of it is ke
 
 
 @router.post("/admin/providers", status_code=201, dependencies=[Depends(require_superuser)])
-def create_provider(body: ProviderCreate):
-    """Create a provider (an `id` and a `full_name`) and its first API key."""
-    provider = registry.create_provider(body.full_name)
+def create_provider(body: ProviderCreate, response: Response,
+                    on_exists: Literal["error", "reuse"] = Query(default="error")):
+    """Create a provider (an `id` and a `full_name`) and its first API key.
+
+    A `full_name` may only belong to one provider, so posting one that is taken is
+    `409 already_exists` rather than a second provider nobody can delete. Names are compared
+    case- and whitespace-insensitively ("  Alice  Almeida " == "alice almeida").
+
+    Pass `?on_exists=reuse` to make a retry safe instead: an existing provider is returned
+    unchanged with `200` and `created: false`, and **no key** — only a hash of the original
+    is kept, so issue a fresh one via `POST /v1/admin/providers/{id}/keys` if you lost it.
+    """
+    provider, created = registry.create_provider(body.full_name, on_exists=on_exists)
+    if not created:
+        response.status_code = 200
+        return {**provider, "created": False, "api_key": None, "key": None,
+                "note": "Reused the existing provider: nothing was created and no key was "
+                        "issued (the original secret is stored only as a hash). Issue one "
+                        f"with POST /v1/admin/providers/{provider['id']}/keys."}
     key = registry.issue_key(provider["id"], label="initial")
-    return {**provider, "api_key": key.pop("api_key"), "key": key, "note": _SHOWN_ONCE}
+    return {**provider, "created": True, "api_key": key.pop("api_key"), "key": key, "note": _SHOWN_ONCE}
 
 
 @router.get("/admin/providers", dependencies=[Depends(require_superuser)])

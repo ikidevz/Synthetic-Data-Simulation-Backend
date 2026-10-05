@@ -4,6 +4,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.routing import APIRoute
@@ -54,10 +57,131 @@ def test_provider_full_name_is_validated(client, su, name):
     )["error"]["code"] == "invalid_provider"
 
 
-def test_each_provider_gets_a_distinct_id_and_key(client, su):
-    a, b = make_provider(client, su, "Twin"), make_provider(client, su, "Twin")
-    # full_name is not unique; id is
-    assert a["id"] != b["id"] and a["api_key"] != b["api_key"]
+def test_a_taken_full_name_is_a_409_not_a_second_provider(client, su):
+    a = make_provider(client, su, "Twin")
+    again = client.post("/v1/admin/providers", json={"full_name": "Twin"}, headers=su)
+    assert again.status_code == 409
+    err = again.json()["error"]
+    assert err["code"] == "already_exists" and a["id"] in err["message"]
+
+    # names are compared case- and whitespace-insensitively
+    for variant in ("  twin  ", "TWIN", "\tTwin\n"):
+        assert client.post("/v1/admin/providers",
+                           json={"full_name": variant}, headers=su).status_code == 409
+
+    twins = [p for p in client.get("/v1/admin/providers", headers=su).json()["items"]
+             if p["full_name"] == "Twin"]
+    assert [t["id"] for t in twins] == [a["id"]]  # still exactly one
+
+
+def test_on_exists_reuse_is_idempotent_and_issues_no_key(client, su):
+    first = client.post("/v1/admin/providers", json={"full_name": "Retryable"}, headers=su).json()
+    assert first["created"] is True and first["api_key"]
+
+    # the same request again: same provider, nothing created, and no new secret
+    second = client.post("/v1/admin/providers", params={"on_exists": "reuse"},
+                         json={"full_name": "Retryable"}, headers=su)
+    assert second.status_code == 200
+    body = second.json()
+    assert body["created"] is False and body["id"] == first["id"]
+    assert body["api_key"] is None and body["key"] is None
+    assert first["id"] in body["note"]  # says where to get a key
+
+    listed = next(p for p in client.get("/v1/admin/providers", headers=su).json()["items"]
+                  if p["id"] == first["id"])
+    assert len(listed["keys"]) == 1  # the retry did not mint a second key
+    # and the first key still works
+    assert client.get("/v1/me", headers={"X-API-Key": first["api_key"]}).json()["id"] == first["id"]
+
+    # a still-unused name is created normally through the same call
+    fresh = client.post("/v1/admin/providers", params={"on_exists": "reuse"},
+                        json={"full_name": "Unused"}, headers=su)
+    assert fresh.status_code == 201 and fresh.json()["created"] is True
+
+
+def test_names_that_look_identical_are_still_one_provider(client, su):
+    """Characters that render as nothing must not buy you a second copy of a name."""
+    client.post("/v1/admin/providers", json={"full_name": "Uni Form"}, headers=su)
+    # Built with chr() rather than literals: these characters are invisible in an
+    # editor and get silently mangled when written out by hand. Each variant spells
+    # "Uni Form" using a different separator, so they must all normalise to the same name.
+    ZWSP, ZWNJ, BOM, NBSP = chr(0x200B), chr(0x200C), chr(0xFEFF), chr(0x00A0)
+    for variant in (
+        BOM + "Uni Form",       # BOM: invisible, and str.strip() does not remove it
+        "Uni" + ZWSP + " Form",  # zero-width space used as the space
+        "Uni " + ZWNJ + "Form",
+        "UNI   FORM",           # case + a run of spaces collapsed to one
+        "Uni\tForm\n",
+        "Uni" + NBSP + "Form",   # non-breaking space
+    ):
+        assert client.post("/v1/admin/providers",
+                           json={"full_name": variant},
+                           headers=su).status_code == 409, ascii(variant)
+    # the ligature and full-width spellings of a *different* name normalise to the same thing
+    client.post("/v1/admin/providers", json={"full_name": "fin co"}, headers=su)
+    for variant in (chr(0xFB01) + "n co",     # the "fi" ligature
+                    "".join(chr(c) for c in (0xFF26, 0xFF29, 0xFF4E)) + " co"):
+        assert client.post("/v1/admin/providers",
+                           json={"full_name": variant},
+                           headers=su).status_code == 409, ascii(variant)
+    names = [p["full_name"] for p in client.get("/v1/admin/providers", headers=su).json()["items"]]
+    assert names.count("Uni Form") == 1 and names.count("fin co") == 1
+
+
+def test_concurrent_creates_of_one_name_make_exactly_one_provider(client, su):
+    """The uniqueness rule must survive a race.
+
+    The old check was `SELECT` all names, compare in Python, then `INSERT` -- a
+    read-then-write gap, so simultaneous requests all saw the name as free and all
+    inserted. This pins the guarantee that one name means one provider, and that the
+    losers get a clean 409 rather than a 500.
+    """
+    barrier = threading.Barrier(6)
+
+    def create():
+        barrier.wait()  # fire all six at the same instant
+        return client.post("/v1/admin/providers",
+                           json={"full_name": "Race Condition"},
+                           headers=su).status_code
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        codes = list(pool.map(lambda _: create(), range(6)))
+
+    assert sorted(codes) == [201, 409, 409, 409, 409, 409], codes
+    listed = client.get("/v1/admin/providers", headers=su).json()["items"]
+    assert [p["full_name"] for p in listed].count("Race Condition") == 1
+
+
+def test_the_database_itself_refuses_a_duplicate_name(client, su):
+    """Belt and braces: the rule is in the schema, not only in the service layer."""
+    made = client.post("/v1/admin/providers",
+                       json={"full_name": "Schema Guard"}, headers=su).json()
+    with engine.begin() as conn:
+        # Bypass registry entirely -- a direct insert of the same name_key must fail.
+        with pytest.raises(Exception):
+            conn.execute(
+                models.registry_providers.insert().values(
+                    id="prov_sneaky", full_name="schema guard",
+                    name_key="schema guard", is_active=True,
+                    is_system=False, created_at=datetime.now(timezone.utc)))
+    assert client.get("/v1/admin/providers", headers=su).json()["items"]
+    assert made["id"].startswith("prov_")
+
+
+def test_renaming_onto_a_taken_name_is_a_409(client, su):
+    a, b = make_provider(client, su, "Nina Nunez"), make_provider(client, su, "Omar Oden")
+    clash = client.patch(f"/v1/admin/providers/{a['id']}",
+                         json={"full_name": b["full_name"]}, headers=su)
+    assert clash.status_code == 409 and clash.json(
+    )["error"]["code"] == "already_exists"
+    # unchanged, and a rename to a free name (or its own) still works
+    assert client.get("/v1/admin/providers", headers=su).json() is not None
+    me = {"X-API-Key": a["api_key"]}
+    assert client.get("/v1/me", headers=me).json()["full_name"] == "Nina Nunez"
+    assert client.patch(f"/v1/admin/providers/{a['id']}",
+                        json={"full_name": "Nina N."}, headers=su).status_code == 200
+    assert client.patch(f"/v1/admin/providers/{a['id']}",
+                        json={"full_name": "Nina Nunez"}, headers=su).status_code == 200  # its own name
 
 
 # ------------------------------------------------------------------ identity ----

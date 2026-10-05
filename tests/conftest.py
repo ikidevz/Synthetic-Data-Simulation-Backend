@@ -65,11 +65,23 @@ def su(authed):
 
 
 def make_provider(client, su, full_name):
-    resp = client.post("/v1/admin/providers",
+    """Create a provider and return a working key for it.
+
+    `alice`/`bob` are module-scoped but the database is session-wide, so by the second
+    test module the name already exists. Rather than hand out a duplicate name, reuse the
+    existing provider and issue a *new* key for it -- the original secret exists only as a
+    hash, so a reused provider must be given a fresh one to be usable.
+    """
+    resp = client.post("/v1/admin/providers", params={"on_exists": "reuse"},
                        json={"full_name": full_name}, headers=su)
-    assert resp.status_code == 201, resp.text
+    assert resp.status_code in (200, 201), resp.text
     body = resp.json()
-    return {"id": body["id"], "full_name": full_name, "key_id": body["key"]["id"],
+    if not body["created"]:
+        again = client.post(f"/v1/admin/providers/{body['id']}/keys",
+                            json={"label": "test"}, headers=su)
+        assert again.status_code == 201, again.text
+        body = {**body, **again.json()}
+    return {"id": body["id"], "full_name": body["full_name"], "key_id": body["key"]["id"],
             "api_key": body["api_key"], "h": {"X-API-Key": body["api_key"]}}
 
 

@@ -1,0 +1,48 @@
+entity: support_tickets_sample
+
+fields:
+  ticket_id:
+    type: uuid
+    primary_key: true
+  order_id:
+    type: ref
+    ref_entity: orders_sample
+  agent_job_title:
+    type: string
+    key_label: job_title
+  category:
+    type: enum
+    values: [billing, shipping, product_defect, account, other]
+  priority:
+    type: int
+    min: 1
+    max: 5
+  is_escalated:
+    type: bool
+  created_at:
+    type: timestamp
+    auto: created
+  updated_at:
+    type: timestamp
+    auto: updated
+  deleted_at:
+    type: timestamp
+    nullable: true
+    auto: soft_delete
+  version:
+    type: int
+    auto: version
+
+seed:
+  initial_count: 20
+
+update_schedule:
+  cadence: daily
+  new_records: [2, 8]
+  mutate_existing_pct: 10
+  soft_delete_pct: 3
+  jitter_seconds: 60
+
+failure_injection:
+  fail_rate: 0.02
+  latency_ms: 50

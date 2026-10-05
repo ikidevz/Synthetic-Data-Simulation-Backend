@@ -127,10 +127,17 @@ registry_providers = Table(
     metadata,
     Column("id", String, primary_key=True),
     Column("full_name", String, nullable=False),
+    # The comparison form of `full_name` (case/whitespace/unicode-normalised -- see
+    # registry._name_key), carried in its own UNIQUE-indexed column. The uniqueness rule
+    # has to live in the schema: a `SELECT`-then-`INSERT` check in Python cannot stop two
+    # concurrent creates from both deciding the name is free. The database is the only
+    # place that can arbitrate a race.
+    Column("name_key", String),
     Column("is_active", Boolean, nullable=False, default=True),
     Column("is_system", Boolean, nullable=False, default=False),
     Column("created_at", DateTime, nullable=False),
 )
+Index("uq_registry_providers_name_key", registry_providers.c.name_key, unique=True)
 
 # Only a SHA-256 of each key is stored; the key itself is shown once, at creation.
 registry_api_keys = Table(

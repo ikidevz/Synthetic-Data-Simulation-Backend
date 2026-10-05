@@ -297,7 +297,7 @@ Private configs return `404`, not `403`, so existence is not revealed. Built-in 
 | Method                 | Path                                       | Purpose                                              |
 | ---------------------- | ------------------------------------------ | ---------------------------------------------------- |
 | `GET`                  | `/v1/me`                                   | Who this key is + quotas                             |
-| `POST` `GET`           | `/v1/admin/providers`                      | **SU:** create provider (returns key once) / list    |
+| `POST` `GET`           | `/v1/admin/providers`                      | **SU:** create provider (key once; unique name) / list |
 | `PATCH`                | `/v1/admin/providers/{id}`                 | **SU:** rename or deactivate                         |
 | `POST` `DELETE`        | `/v1/admin/providers/{id}/keys[/{key_id}]` | **SU:** issue / revoke keys                          |
 | `POST`                 | `/v1/configs`                              | Publish (JSON or YAML); SU may use `?provider_id=`   |

@@ -38,6 +38,7 @@ from .db.engine import engine
 from .security.api_keys import check_configuration, docs_enabled, require_superuser, verify_api_key
 from .services import entity_ops
 from .services import metrics as metrics_module
+from .services import registry
 from .services.batch import DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, MAX_ROWS_PER_ENTITY, BatchError, run_batch, run_changes
 from .services.catalog import catalog
 from .services.changefeed import CursorAheadError, get_changes, log_change
@@ -361,6 +362,9 @@ def on_startup():
     catalog.load(CONFIGS, TABLES)
     # ...and any provider table that doesn't exist yet
     models.metadata.create_all(engine)
+    # create_all cannot add a column to an existing table, so the provider-name
+    # uniqueness column is added/backfilled separately. Idempotent.
+    registry.ensure_name_key_column()
     _seed_all()
     _register_entity_routes()
     _scheduler = start_scheduler(engine, TABLES, CONFIGS)

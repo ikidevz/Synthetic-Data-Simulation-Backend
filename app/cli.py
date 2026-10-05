@@ -54,7 +54,10 @@ def _build_parser() -> argparse.ArgumentParser:
     prov = sub.add_parser(
         "create-provider", help="create a provider and print its API key (shown once)")
     prov.add_argument("--full-name", required=True,
-                      help="the provider's display name")
+                      help="the provider's display name (unique; case-insensitive)")
+    prov.add_argument("--on-exists", choices=["error", "reuse"], default="error",
+                      help="'error' (default) fails if the name is taken; 'reuse' returns "
+                           "that provider without creating anything (no key is printed)")
 
     ddl = sub.add_parser(
         "ddl", help="print CREATE TABLE / CREATE INDEX statements")
@@ -112,13 +115,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "create-provider":
         try:
             models.metadata.create_all(engine, tables=models.REGISTRY_TABLES)
+            registry.ensure_name_key_column()
             registry.ensure_system_provider()
-            provider = registry.create_provider(args.full_name)
+            provider, created = registry.create_provider(
+                args.full_name, on_exists=args.on_exists)
+            if not created:
+                print(json.dumps({**provider, "created": False}, indent=2))
+                print(f"note: reused the existing provider; no key issued (only a hash of "
+                      f"the original is kept). Issue one with POST /v1/admin/providers/"
+                      f"{provider['id']}/keys", file=sys.stderr)
+                return 0
             key = registry.issue_key(provider["id"], label="initial")
         except ApiError as exc:
             print(f"error [{exc.code}]: {exc.message}", file=sys.stderr)
             return 1
-        print(json.dumps({**provider, "api_key": key["api_key"]}, indent=2))
+        print(json.dumps({**provider, "created": True, "api_key": key["api_key"]}, indent=2))
         return 0
     try:
         configs = load_entity_configs(get_config_dir())

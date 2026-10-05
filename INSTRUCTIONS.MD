@@ -8,36 +8,106 @@ Everything here was derived from the source code and README. Where something is 
 
 ---
 
-## Table of contents
+## How to use this guide
 
-- [Quick start (5 minutes)](#quick-start-5-minutes)
-- [0. Before you start](#0-before-you-start)
-- [1. Install, configure, run](#1-install-configure-run)
-- [2. Who can do what (roles)](#2-who-can-do-what-roles)
-- [3. Authentication tests](#3-authentication-tests)
-- [4. Provider & API-key management (superuser)](#4-provider--api-key-management-superuser)
-- [5. Configs: create, validate, list, edit, delete](#5-configs-create-validate-list-edit-delete)
-- [6. CRUD on rows](#6-crud-on-rows)
-- [7. The change feed](#7-the-change-feed)
-- [8. Batch generation (append / replace / reset)](#8-batch-generation-append--replace--reset)
-- [9. Simulate (inserts + updates + deletes on demand)](#9-simulate-inserts--updates--deletes-on-demand)
-- [10. The scheduler](#10-the-scheduler)
-- [11. Failure injection](#11-failure-injection)
-- [12. Export (snapshot, delta, zip bundle)](#12-export-snapshot-delta-zip-bundle)
-- [13. DDL export](#13-ddl-export)
-- [14. Metrics and job runs](#14-metrics-and-job-runs)
-- [15. Sharing & isolation between providers](#15-sharing--isolation-between-providers)
-- [16. Superuser-only legacy routes (built-in entities)](#16-superuser-only-legacy-routes-built-in-entities)
-- [17. CLI (no server needed)](#17-cli-no-server-needed)
-- [18. Error reference](#18-error-reference)
-- [19. Restart, Postgres, Docker, pytest](#19-restart-postgres-docker-pytest)
-- [20. One-shot smoke-test script](#20-one-shot-smoke-test-script)
-- [21. Master checklist](#21-master-checklist)
-- [22. Gotchas worth knowing](#22-gotchas-worth-knowing)
+This is a **hands-on manual**, not a reference to read cover-to-cover: every
+section is a set of runnable Python snippets plus the exact response you should
+get back. Work through it in order the first time; afterwards, jump straight to
+the one section you need.
+
+**Set up the shared helpers first.** [0. Before you start](#0-before-you-start)
+defines `pv`, `su`, `st`, `pp` and the `BASE` / `SU` / `KEY` / `KEY2` / `CID` /
+`OID` placeholders. Every snippet from Part 2 onward assumes they exist, so do
+not skip it.
+
+### Suggested reading paths
+
+| If you are… | Read, in order |
+|---|---|
+| A **new tester**, first pass | Quick start → 0 → 1 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 21 |
+| Testing **permissions / multi-tenancy** | 2 (roles) → 3 (auth) → 4 (keys) → 15 (isolation) → 16 (legacy) |
+| Testing **data generation** | 5 (configs) → 8 (batch) → 9 (simulate) → 10 (scheduler) → 11 (failures) |
+| Testing **export / DDL / metrics** | 12 (export) → 13 (DDL) → 14 (metrics) |
+| An **operator** (deploy, Docker, CI) | 1 (install) → 17 (CLI) → 19 (Postgres/Docker/pytest) → 20 (smoke test) |
+| Looking something **up** | 18 (error reference) → 22 (gotchas) |
+
+### What is in each part
+
+| Part | Sections | Covers |
+|---|---|---|
+| 1 | Quick start, 0 | The five-minute path; tools, placeholders, shared helpers |
+| 2 | 1–4 | Install & env vars, roles, authentication, providers and API keys |
+| 3 | 5 | Configs: anatomy, validation, publish, edit, delete, dependencies |
+| 4 | 6–11 | Rows: CRUD, change feed, batch, simulate, scheduler, failure injection |
+| 5 | 12–14 | Snapshot / delta / zip export, DDL export, metrics and job runs |
+| 6 | 15–16 | Sharing & isolation between providers; superuser-only legacy routes |
+| 7 | 17, 19, 20 | CLI, restart / PostgreSQL / Docker / pytest, one-shot smoke test |
+| 8 | 18, 21, 22 | Error envelope reference, master checklist, gotchas |
+
+### Conventions used throughout
+
+- `**[SU]**` needs a superuser key · `**[P]**` a provider key · `**[SU/P]**` either · `**[operator]**` shell only.
+- `**(observed in code)**` marks behaviour read out of the source rather than stated in the README.
+- `# Expect:` comments show the response you are supposed to get.
+- `pp(...)` pretty-prints; `pv` / `su` / `st` are thin wrappers over `requests`.
+- Section numbers are stable — `§5.7` always means subsection 5.7 wherever you see it.
+- A `#` at the start of a line inside a snippet is a comment, not a step to run.
 
 ---
 
-## Quick start (5 minutes)
+## Table of contents
+
+**Part 1 — Orientation: your first five minutes**
+
+  - [Quick start (5 minutes)](#quick-start-5-minutes)
+  - [0. Before you start](#0-before-you-start)
+
+**Part 2 — Install, access & identity**
+
+  - [1. Install, configure, run](#1-install-configure-run)
+  - [2. Who can do what (roles)](#2-who-can-do-what-roles)
+  - [3. Authentication tests](#3-authentication-tests)
+  - [4. Provider & API-key management (superuser)](#4-provider--api-key-management-superuser)
+
+**Part 3 — Configs (the core object)**
+
+  - [5. Configs: create, validate, list, edit, delete](#5-configs-create-validate-list-edit-delete)
+
+**Part 4 — Working with the generated rows**
+
+  - [6. CRUD on rows](#6-crud-on-rows)
+  - [7. The change feed](#7-the-change-feed)
+  - [8. Batch generation (append / replace / reset)](#8-batch-generation-append--replace--reset)
+  - [9. Simulate (inserts + updates + deletes on demand)](#9-simulate-inserts--updates--deletes-on-demand)
+  - [10. The scheduler](#10-the-scheduler)
+  - [11. Failure injection](#11-failure-injection)
+
+**Part 5 — Getting the data out**
+
+  - [12. Export (snapshot, delta, zip bundle)](#12-export-snapshot-delta-zip-bundle)
+  - [13. DDL export](#13-ddl-export)
+  - [14. Metrics and job runs](#14-metrics-and-job-runs)
+
+**Part 6 — Multi-tenancy & superuser powers**
+
+  - [15. Sharing & isolation between providers](#15-sharing--isolation-between-providers)
+  - [16. Superuser-only legacy routes (built-in entities)](#16-superuser-only-legacy-routes-built-in-entities)
+
+**Part 7 — Tooling & operations**
+
+  - [17. CLI (no server needed)](#17-cli-no-server-needed)
+  - [19. Restart, Postgres, Docker, pytest](#19-restart-postgres-docker-pytest)
+  - [20. One-shot smoke-test script](#20-one-shot-smoke-test-script)
+
+**Part 8 — Reference, checklist & wrap-up**
+
+  - [18. Error reference](#18-error-reference)
+  - [21. Master checklist](#21-master-checklist)
+  - [22. Gotchas worth knowing](#22-gotchas-worth-knowing)
+
+## Part 1 — Orientation: your first five minutes
+
+### Quick start (5 minutes)
 
 The shortest path from nothing to "I created an API key, published a YAML config and read generated data".
 
@@ -104,7 +174,7 @@ If step 4 returned `"seeded_rows": 30` you are done with the basics. The rest of
 
 ---
 
-## 0. Before you start
+### 0. Before you start
 
 **Tools:** Python 3.10+, `requests`. Optional: `sqlite3` CLI, `psql`, a zip library (stdlib `zipfile`). You can still use the Swagger UI (see [3.4](#34-swagger-ui-authorize-button)).
 
@@ -184,9 +254,11 @@ st("GET", "/v1/me", key=KEY)   # prints status only
 
 ---
 
-## 1. Install, configure, run
+## Part 2 — Install, access & identity
 
-### 1.1 Install and start
+### 1. Install, configure, run
+
+#### 1.1 Install and start
 
 ```python
 # Terminal (once):
@@ -210,7 +282,7 @@ print("SUPERUSER KEY:", key)
 
 **On first start the app:** creates `synthetic.db` (SQLite) → creates all tables → seeds `customers` (30) → `orders` (50) → `support_tickets` (20), in dependency order → starts one background job per entity.
 
-### 1.2 Verify it is alive
+#### 1.2 Verify it is alive
 
 ```python
 r = requests.get(f"{BASE}/health")          # [none]
@@ -223,7 +295,7 @@ r = su("GET", "/metrics")                   # [SU]
 pp(r.json())                                # row_count 30 / 50 / 20
 ```
 
-### 1.3 Environment variables (complete list)
+#### 1.3 Environment variables (complete list)
 
 | Variable                   | Default                    | Effect                                                                                                                                  |
 | -------------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
@@ -244,7 +316,7 @@ All of these are read when the process starts; **restart after changing any of t
 
 ---
 
-## 2. Who can do what (roles)
+### 2. Who can do what (roles)
 
 There are three kinds of caller.
 
@@ -267,16 +339,16 @@ The built-in YAML entities are owned by a system provider (`prov_system`, ids `c
 
 ---
 
-## 3. Authentication tests
+### 3. Authentication tests
 
-### 3.1 Public route
+#### 3.1 Public route
 
 ```python
 r = requests.get(f"{BASE}/health")   # 200 with NO key (the only unauthenticated API route)
 print(r.status_code, r.json())
 ```
 
-### 3.2 Missing / wrong key → 401 with the standard envelope
+#### 3.2 Missing / wrong key → 401 with the standard envelope
 
 ```python
 for headers in ({}, {"X-API-Key": "nope"}, {"X-API-Key": ""}):
@@ -286,7 +358,7 @@ for headers in ({}, {"X-API-Key": "nope"}, {"X-API-Key": ""}):
 # body {"error":{"code":"unauthorized","message":"invalid or missing API key"}}
 ```
 
-### 3.3 The key must travel in the `X-API-Key` header — nothing else works
+#### 3.3 The key must travel in the `X-API-Key` header — nothing else works
 
 ```python
 st("GET", f"/v1/me?api_key={SU}")                              # 401 (keys in URLs are refused)
@@ -297,11 +369,11 @@ st("GET", "/v1/me", key=SU)                                    # 200
 
 Failed attempts are logged by the server (method, path, client address) — **never the key**. Check the uvicorn console.
 
-### 3.4 Swagger UI Authorize button
+#### 3.4 Swagger UI Authorize button
 
 Open `{BASE}/docs` → **Authorize** → paste a key → _Authorize_. Every "Try it out" now sends `X-API-Key`. Use the superuser key to try everything, or a provider key to see 403s on admin/legacy routes. (`/docs` itself is public unless `ENABLE_DOCS=false`.)
 
-### 3.5 Auth OFF mode (local dev)
+#### 3.5 Auth OFF mode (local dev)
 
 Start the server with **no** `API_KEY`/`API_KEYS`:
 
@@ -319,7 +391,7 @@ pp(r.json())
 
 **Expect** a startup warning that authentication is **DISABLED**. Provider keys only take effect once a superuser key is set.
 
-### 3.6 `REQUIRE_API_KEY` fails fast
+#### 3.6 `REQUIRE_API_KEY` fails fast
 
 ```python
 # Terminal:
@@ -328,7 +400,7 @@ pp(r.json())
 # Expect: the process exits with an error mentioning REQUIRE_API_KEY and genkey.
 ```
 
-### 3.7 Rotate the superuser key without downtime
+#### 3.7 Rotate the superuser key without downtime
 
 ```python
 import subprocess
@@ -343,7 +415,7 @@ st("GET", "/v1/me", key=new_key)   # 200
 st("GET", "/v1/me", key="<old>")   # 401
 ```
 
-### 3.8 Turn docs off
+#### 3.8 Turn docs off
 
 ```python
 # Terminal: ENABLE_DOCS=false API_KEY=$SU uvicorn app.main:app
@@ -352,17 +424,17 @@ st("GET", "/openapi.json")   # 404
 st("GET", "/health")         # 200
 ```
 
-### 3.9 A key shorter than 24 characters
+#### 3.9 A key shorter than 24 characters
 
 Start with `API_KEY=short`: the server starts but logs a warning recommending `genkey`.
 
 ---
 
-## 4. Provider & API-key management (superuser)
+### 4. Provider & API-key management (superuser)
 
 A **provider** is a publisher of configs (an `id` + `full_name`). There is **no open sign-up** — only the superuser can create providers. Providers **cannot be deleted** (there is no route); they can only be **deactivated**.
 
-### 4.1 Create a provider and its first key **[SU]**
+#### 4.1 Create a provider and its first key **[SU]**
 
 ```python
 r = su("POST", "/v1/admin/providers", headers=JSON, json={"full_name": "Alice Almeida"})
@@ -381,8 +453,23 @@ KEY2 = bob["api_key"]
 B_ID = bob["id"]
 ```
 
-**Expect `201`** with: `id` (`prov_…`), `full_name`, `is_active: true`, `is_system: false`, `api_key` (the secret — **shown exactly once**), `key` (`id`, `key_prefix` = first 8 chars of the secret, `label: "initial"`), and a `note` telling you to store it now.
-`full_name` is trimmed and must be 1–100 characters; it is **not unique** (two "Twin" providers get different ids and keys).
+**Expect `201`** with: `id` (`prov_…`), `full_name`, `is_active: true`, `is_system: false`, `created: true`, `api_key` (the secret — **shown exactly once**), `key` (`id`, `key_prefix` = first 8 chars of the secret, `label: "initial"`), and a `note` telling you to store it now.
+`full_name` is trimmed and must be 1–100 characters. It is **unique**, compared case- and whitespace-insensitively (`"  Alice  Almeida "` == `"alice almeida"`) — a repeated POST is a retry, not a request for a second provider.
+
+**Duplicate name → `409 already_exists`**, and the message names the `id` already using it:
+
+```python
+su("POST", "/v1/admin/providers", headers=JSON, json={"full_name": "Alice Almeida"}).status_code  # 409
+```
+
+**Idempotent retries — `?on_exists=reuse`:** returns the existing provider with **`200`**, `created: false`, and `api_key`/`key` both `null`. Nothing is created and **no new key is issued** (only the original's hash is kept, so it cannot be re-shown); the `note` points at `POST /v1/admin/providers/{id}/keys` if you need a new one. A name that is still free is created normally (`201`, `created: true`).
+
+```python
+r = su("POST", "/v1/admin/providers?on_exists=reuse", headers=JSON, json={"full_name": "Alice Almeida"})
+print(r.status_code, r.json()["created"], r.json()["api_key"])   # 200 False None
+```
+
+> There is no route to delete a provider, so a duplicate could only ever be *deactivated* — refusing to create it is the fix, not a cleanup.
 
 **Negative tests**
 
@@ -397,15 +484,17 @@ for body in (
     print(r.status_code, r.json())   # 422 invalid_provider / validation_error
 ```
 
-### 4.2 Create a provider from the CLI (no server needed) **[operator]**
+#### 4.2 Create a provider from the CLI (no server needed) **[operator]**
 
 ```python
 # Terminal (or subprocess):
 #   python -m app.cli create-provider --full-name "Hana Hidalgo"
 # Prints JSON with id and api_key (once). Writes straight to DATABASE_URL.
+#   --on-exists reuse   return that provider instead of failing (nothing created, no key)
+# A taken name fails with `error [already_exists]: …` and exit 1.
 ```
 
-### 4.3 Who am I? **[SU/P]**
+#### 4.3 Who am I? **[SU/P]**
 
 ```python
 pp(pv("GET", "/v1/me").json())   # role "provider", id, full_name, configs_owned, limits{...}
@@ -414,7 +503,7 @@ pp(su("GET", "/v1/me").json())   # role "superuser", id null
 
 `limits` shows the live quotas (`max_configs`, `max_fields`, `max_initial_count`, `max_rows`, `max_latency_ms`, `max_body_bytes`).
 
-### 4.4 List providers **[SU]**
+#### 4.4 List providers **[SU]**
 
 ```python
 pp(su("GET", "/v1/admin/providers").json())
@@ -422,11 +511,11 @@ pp(su("GET", "/v1/admin/providers").json())
 
 Each provider shows `config_count` and its `keys[]` (`id`, `key_prefix`, `label`, `created_at`, `revoked_at`, `last_used_at`). **Secrets are never listed again.** The built-in `prov_system` appears with `is_system: true` and no keys.
 
-### 4.5 `last_used_at`
+#### 4.5 `last_used_at`
 
 Before first use `last_used_at` is `null`. Call `pv("GET", "/v1/me")`, then list providers again → it is filled in. (It is refreshed at most every 5 minutes.)
 
-### 4.6 Rename, deactivate, reactivate **[SU]**
+#### 4.6 Rename, deactivate, reactivate **[SU]**
 
 ```python
 pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"full_name": "Alice A."}).json())
@@ -434,11 +523,14 @@ pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"is_active": F
 st("GET", "/v1/me", key=KEY)   # 401 — keys of an inactive provider are locked out
 pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"is_active": True}).json())
 st("GET", "/v1/me", key=KEY)   # 200 — restored
+
+# renaming onto a name another provider holds -> 409 already_exists
+pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"full_name": "Bob Bautista"}).json())
 ```
 
 > A deactivated provider's **public configs stay readable and keep updating** — deactivation only locks its keys out.
 
-### 4.7 Issue a second key and rotate **[SU]**
+#### 4.7 Issue a second key and rotate **[SU]**
 
 ```python
 r = su("POST", f"/v1/admin/providers/{A_ID}/keys", headers=JSON, json={"label": "ci"})
@@ -467,7 +559,7 @@ print(su("PATCH", "/v1/admin/providers/prov_system", headers=JSON, json={"is_act
 print(su("POST", "/v1/admin/providers/prov_system/keys").status_code)                 # 409
 ```
 
-### 4.8 Providers cannot escalate **[P → expect 403]**
+#### 4.8 Providers cannot escalate **[P → expect 403]**
 
 ```python
 specs = [
@@ -483,7 +575,7 @@ for method, path in specs:
 # Expect 403 on every line, body {"error":{"code":"forbidden","message":"this route needs a superuser API key"}}
 ```
 
-### 4.9 Keys are stored hashed
+#### 4.9 Keys are stored hashed
 
 Only a SHA-256 of each key is stored (look at the `registry_api_keys` table: `key_hash`, `key_prefix`).
 
@@ -500,11 +592,13 @@ print(hashlib.sha256(KEY.encode()).hexdigest())  # must match the full key_hash 
 
 ---
 
-## 5. Configs: create, validate, list, edit, delete
+## Part 3 — Configs (the core object)
+
+### 5. Configs: create, validate, list, edit, delete
 
 A **config** describes one entity (a table + its generation rules + its update schedule). Publishing one creates a real table, seeds it, and registers a recurring background job. Nothing in Python changes.
 
-### 5.1 Anatomy of a config (annotated)
+#### 5.1 Anatomy of a config (annotated)
 
 ```yaml
 entity: acme_customers # or `name:`. 1-32 chars: ^[a-z][a-z0-9_]{0,31}$ ; "schema" and "manifest" are reserved
@@ -558,7 +652,7 @@ failure_injection:
 Other rules: field names `^[a-z][a-z0-9_]{0,39}$` · unknown keys anywhere are **rejected** (typos fail loudly) · YAML anchors/aliases are **rejected** · a config name is unique per provider (two providers may each have an `orders`).
 `failure_injection.drift` is accepted by the parser but **has no effect** (schema-drift injection is listed as not implemented).
 
-### 5.2 Save three example configs (a 3-level chain)
+#### 5.2 Save three example configs (a 3-level chain)
 
 ```python
 ACME_CUSTOMERS_YAML = """\
@@ -619,16 +713,128 @@ Path("acme_orders.yaml").write_text(ACME_ORDERS_YAML)
 Path("acme_tickets.yaml").write_text(ACME_TICKETS_YAML)
 ```
 
-### 5.3 Ways to get a config into the system
+#### 5.3 Ways to get a config into the system
 
 | Way                                      | Who                   | How                                                      | Notes                                                                                                                                                                                                                                                                                                        |
 | ---------------------------------------- | --------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **A. Built-in YAML file**                | operator              | drop `configs/<name>.yaml`, **restart** the server       | owned by `prov_system`, id `cfg_sys_<name>`, public, **writable only by the superuser**, no row quota. Invalid refs/types/cycles fail at **startup**. Per-entity routes `/<name>` appear for the superuser. File configs are **not** checked for unknown keys the way API configs are **(observed in code)** |
 | **B. API — YAML body**                   | provider or superuser | `POST /v1/configs` with `Content-Type: text/yaml`        | a file from `configs/` posts as-is                                                                                                                                                                                                                                                                           |
-| **C. API — JSON body**                   | provider or superuser | `POST /v1/configs` with `Content-Type: application/json` | any content-type that isn't JSON is parsed as YAML (YAML ⊇ JSON)                                                                                                                                                                                                                                             |
+| **C. API — JSON body**                   | provider or superuser | `POST /v1/configs` with `Content-Type: application/json` | **expanded below with the full §5.2 chain in JSON**. Any content-type that isn't JSON (or `…+json`) is parsed as YAML (YAML ⊇ JSON)                                                                                                                                                                                                                                             |
 | **D. Superuser on behalf of a provider** | superuser             | `POST /v1/configs?provider_id=prov_…`                    | without `provider_id` the config is owned by the system provider                                                                                                                                                                                                                                             |
 
-### 5.4 Dry-run validation (saves nothing) **[SU/P]**
+**C. API — JSON body, spelled out.** The same three configs from §5.2, converted to JSON. The document means the same thing — `parse_body()` runs `json.loads` for `application/json` (or any `…+json`) and hands the dict to the **same** validator, so unknown keys, quotas, `ref` resolution and seeding behave exactly as in §5.5.
+
+```python
+ACME_CUSTOMERS = {
+    "entity": "acme_customers",
+    "fields": {
+        "customer_id":    {"type": "uuid", "primary_key": True},
+        "full_name":      {"type": "string", "key_label": "full_name"},
+        "email":          {"type": "string", "key_label": "email_address"},
+        "segment":        {"type": "enum", "values": ["retail", "wholesale", "enterprise"]},
+        "lifetime_value": {"type": "float", "min": 0, "max": 10000},
+        "loyalty_points": {"type": "int", "min": 0, "max": 5000},
+        "is_vip":         {"type": "bool"},
+        "signup_at":      {"type": "timestamp"},
+        "notes":          {"type": "string", "nullable": True},
+        "created_at":     {"type": "timestamp", "auto": "created"},
+        "updated_at":     {"type": "timestamp", "auto": "updated"},
+        "deleted_at":     {"type": "timestamp", "nullable": True, "auto": "soft_delete"},
+    },
+    "seed": {"initial_count": 25},
+    "update_schedule": {"cadence": "hourly", "new_records": [1, 5], "mutate_existing_pct": 5,
+                        "soft_delete_pct": 1, "jitter_seconds": 30},
+    "failure_injection": {"fail_rate": 0.0, "latency_ms": 0},
+}
+
+ACME_ORDERS = {
+    "entity": "acme_orders",
+    "fields": {
+        "order_id":    {"type": "uuid", "primary_key": True},
+        "customer_id": {"type": "ref", "ref_entity": "acme_customers"},
+        "amount":      {"type": "float", "min": 10, "max": 500},
+        "status":      {"type": "enum", "values": ["pending", "shipped", "cancelled"]},
+        "note":        {"type": "string", "nullable": True},
+        "created_at":  {"type": "timestamp", "auto": "created"},
+        "updated_at":  {"type": "timestamp", "auto": "updated"},
+        "deleted_at":  {"type": "timestamp", "nullable": True, "auto": "soft_delete"},
+    },
+    "seed": {"initial_count": 40},
+    "update_schedule": {"cadence": "hourly", "new_records": [3, 8], "mutate_existing_pct": 5,
+                        "soft_delete_pct": 1, "jitter_seconds": 30},
+    "failure_injection": {"fail_rate": 0.0, "latency_ms": 0},
+}
+
+ACME_TICKETS = {
+    "entity": "acme_tickets",
+    "fields": {
+        "ticket_id":       {"type": "uuid", "primary_key": True},
+        "order_id":        {"type": "ref", "ref_entity": "acme_orders"},
+        "agent_job_title": {"type": "string", "key_label": "job_title"},
+        "category":        {"type": "enum", "values": ["billing", "shipping", "product_defect",
+                                                       "account", "other"]},
+        "priority":        {"type": "int", "min": 1, "max": 5},
+        "is_escalated":    {"type": "bool"},
+        "created_at":      {"type": "timestamp", "auto": "created"},
+        "updated_at":      {"type": "timestamp", "auto": "updated"},
+        "deleted_at":      {"type": "timestamp", "nullable": True, "auto": "soft_delete"},
+    },
+    "seed": {"initial_count": 15},
+    "update_schedule": {"cadence": "daily", "new_records": [1, 4], "mutate_existing_pct": 10,
+                        "soft_delete_pct": 3, "jitter_seconds": 60},
+    "failure_injection": {"fail_rate": 0.0, "latency_ms": 0},
+}
+```
+
+Publish them **parents first** — a `ref` must already name a config of yours, and that parent must already hold rows:
+
+```python
+published = {}
+for cfg in (ACME_CUSTOMERS, ACME_ORDERS, ACME_TICKETS):
+    r = pv("POST", "/v1/configs", headers=JSON, json=cfg)
+    r.raise_for_status()
+    body = r.json()
+    published[body["name"]] = body["id"]
+    print(body["name"], body["id"], "source:", body["source"], "seeded_rows:", body["seeded_rows"])
+
+CID = published["acme_customers"]
+OID = published["acme_orders"]
+TID = published["acme_tickets"]
+# Expect 201 each; source "api"; seeded_rows 25 / 40 / 15; response["config"]["fields"] also
+# holds a `version` int field you never sent — it is added for you.
+```
+
+`requests` sets `Content-Type: application/json` on its own when you pass `json=`, so `headers=JSON` is belt-and-braces. To go through a file instead, serialise and post the bytes:
+
+```python
+Path("acme_customers.json").write_text(json.dumps(ACME_CUSTOMERS, indent=2))
+
+# a) honest JSON
+r = pv("POST", "/v1/configs", headers=JSON, data=Path("acme_customers.json").read_text())
+print(r.status_code)                       # 201
+
+# b) the same JSON mislabelled as YAML — still fine, YAML is a superset of JSON
+r = pv("POST", "/v1/configs", headers=YAML, data=Path("acme_customers.json").read_text())
+print(r.status_code)                       # 409 already_exists (posted in step a)
+```
+
+Notes and traps specific to this route:
+
+| Do this                                                  | Get this                                                                                          |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| omit `Content-Type` entirely                             | read as **YAML** — a JSON body still parses; only a `…+json` type forces the JSON branch **(observed in code)** |
+| send `application/vnd.api+json`                          | still JSON — the check is `kind.endswith("+json")` **(observed in code)**                            |
+| send a trailing comma or a `#` comment                   | `422 invalid_config` "invalid JSON: …" (JSON has no comments, YAML does)                             |
+| send a JSON array or a bare scalar                       | `422 invalid_config` "the config must be an object (a mapping of keys to values)"                    |
+| send non-UTF-8 bytes                                     | `422 invalid_config` "body must be UTF-8 text"                                                      |
+| exceed `MAX_BODY_BYTES`                                  | `413 payload_too_large` — checked before parsing **(observed in code)**                               |
+| re-publish an entity name you already hold               | `409 already_exists` — a config name is unique per provider                                          |
+
+Nothing else changes: the JSON route shares the auto-added `version` field, `key_label` trial generation through iki-data-generator, unknown-key rejection, the `MAX_CONFIGS_PER_PROVIDER` / `MAX_FIELDS_PER_CONFIG` quotas, `is_only_me` privacy and the `?provider_id=` variant of way D with the YAML route. The only YAML-specific guard — rejecting anchors/aliases — lives in the YAML branch, so it simply has nothing to catch here. Continue with §5.4 to dry-run one of these, or §5.5 to publish the YAML files instead.
+
+
+
+#### 5.4 Dry-run validation (saves nothing) **[SU/P]**
 
 ```python
 r = pv("POST", "/v1/configs/validate", headers=YAML, data=Path("acme_customers.yaml").read_text())
@@ -636,7 +842,7 @@ pp(r.json())
 # Expect 200: {"valid": true, "name_available": true, "is_only_me": false, "config": {…normalized, with version added…}}
 ```
 
-### 5.5 Publish **[SU/P]**
+#### 5.5 Publish **[SU/P]**
 
 ```python
 # parents first
@@ -677,7 +883,7 @@ print("scratch seeded_rows:", r.json()["seeded_rows"])
 
 Check the table namespacing (SQLite): internal tables look like `d_<10 hex>_acme_customers`. **You never see those names in API responses, DDL, exports or error messages.**
 
-### 5.6 List and read configs **[SU/P]**
+#### 5.6 List and read configs **[SU/P]**
 
 ```python
 items = pv("GET", "/v1/configs").json()["items"]
@@ -691,7 +897,7 @@ pp(pv("GET", f"/v1/configs/{CID}").json())   # full definition under "config"
 
 The list is a summary (no `config` key). `can_write` tells you whether _you_ may change it. `scope` other than `mine|shared|all` → `422`.
 
-### 5.7 Edit a config (`PATCH`) **[SU/P — owner]**
+#### 5.7 Edit a config (`PATCH`) **[SU/P — owner]**
 
 | Key you may send                               | Behaviour                                                                                                                                                                                                |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -775,7 +981,7 @@ print(r.json()["is_only_me"])   # allowed
 su("PATCH", "/v1/configs/cfg_sys_support_tickets", headers=JSON, json={"is_only_me": False})
 ```
 
-### 5.8 Delete a config **[SU/P — owner]**
+#### 5.8 Delete a config **[SU/P — owner]**
 
 ```python
 r = pv("DELETE", f"/v1/configs/{SID}")
@@ -788,7 +994,7 @@ st("GET", f"/v1/configs/{SID}", key=KEY)   # 404
 
 Deleting drops the table **and** its change history, unschedules its job, and frees a quota slot and the name. Built-in configs: `409 managed_by_yaml`.
 
-### 5.9 Dependencies (parents, children, cycles)
+#### 5.9 Dependencies (parents, children, cycles)
 
 ```python
 # 1. a child can't reference a config you don't have
@@ -824,7 +1030,7 @@ print(r.status_code, r.json().get("error"))   # 409 has_dependents (lists acme_o
 # delete children first: tickets -> orders -> customers
 ```
 
-### 5.10 Bad-config gauntlet (every message should be clear)
+#### 5.10 Bad-config gauntlet (every message should be clear)
 
 ```python
 def try_cfg(label: str, body: dict) -> None:
@@ -890,7 +1096,7 @@ print(r.status_code, r.json().get("error"))   # 413 payload_too_large
 
 **Duplicate name:** publish `acme_customers.yaml` again → `409 already_exists`.
 
-### 5.11 Quotas — test them by starting the server with small limits
+#### 5.11 Quotas — test them by starting the server with small limits
 
 Use a **fresh database**:
 
@@ -914,7 +1120,7 @@ Use a **fresh database**:
 
 > Tip: `pv("GET", "/v1/me").json()["limits"]` always shows the limits the server actually runs with. Row caps apply to **provider configs** only; built-in YAML configs have no cap.
 
-### 5.12 Superuser publishing for someone else
+#### 5.12 Superuser publishing for someone else
 
 ```python
 r = su("POST", "/v1/configs", params={"provider_id": B_ID}, headers=JSON, json={
@@ -934,11 +1140,13 @@ print(r.status_code, r.json().get("error"))   # 404
 
 ---
 
-## 6. CRUD on rows
+## Part 4 — Working with the generated rows
+
+### 6. CRUD on rows
 
 Rows live under `/v1/configs/{config_id}/data`. **Reads:** owner, superuser, or anyone if the config is public. **Writes:** owner or superuser only. Examples use `$OID` (`acme_orders`).
 
-### 6.1 Create **[P/SU]**
+#### 6.1 Create **[P/SU]**
 
 ```python
 # a) completely generated row (empty body)
@@ -962,7 +1170,7 @@ pp({"order_id": r.json()["order_id"], "customer_id": r.json()["customer_id"], "a
 
 **Expect `201`** and the full row: generated `order_id`, `version` (next table-wide number), `created_at`/`updated_at` set, `deleted_at: null`.
 
-### 6.2 List + keyset pagination **[SU/P]**
+#### 6.2 List + keyset pagination **[SU/P]**
 
 ```python
 seen = []
@@ -986,7 +1194,7 @@ print(pv("GET", f"/v1/configs/{OID}/data", params={"limit": 501}).status_code)  
 print(pv("GET", f"/v1/configs/{OID}/data", params={"limit": 0}).status_code)    # 422
 ```
 
-### 6.3 Get one row **[SU/P]**
+#### 6.3 Get one row **[SU/P]**
 
 ```python
 pp(pv("GET", f"/v1/configs/{OID}/data/{RID}").json())
@@ -994,14 +1202,14 @@ r = pv("GET", f"/v1/configs/{OID}/data/nope")
 print(r.status_code, r.json()["error"]["message"])   # 404 — uses your config name
 ```
 
-### 6.4 Update **[P/SU]**
+#### 6.4 Update **[P/SU]**
 
 ```python
 r = pv("PUT", f"/v1/configs/{OID}/data/{RID}", headers=JSON, json={"status": "shipped"})
 print(r.json()["status"], r.json()["version"])   # shipped, version bumped
 ```
 
-### 6.5 Soft delete **[P/SU]**
+#### 6.5 Soft delete **[P/SU]**
 
 ```python
 r = pv("DELETE", f"/v1/configs/{OID}/data/{RID}")
@@ -1011,7 +1219,7 @@ print(pv("GET", f"/v1/configs/{OID}/data/{RID}").status_code)   # 404
 
 Soft-deleted rows reappear with `include_deleted=true` on export (see §12).
 
-### 6.6 Row validation matrix
+#### 6.6 Row validation matrix
 
 ```python
 def try_write(label: str, payload: dict) -> None:
@@ -1038,7 +1246,7 @@ A `ref` value must point to an **existing row in your own parent config**.
 
 > **Legacy routes are looser.** `POST/PUT /orders` (superuser, built-in entities) don't validate field names, types or references — use `/v1` when you want validation.
 
-### 6.7 Permissions on rows
+#### 6.7 Permissions on rows
 
 ```python
 print(len(pv2("GET", f"/v1/configs/{OID}/data", params={"limit": 1}).json()["items"]))  # Bob can READ
@@ -1050,11 +1258,11 @@ print(r.json().get("order_id"))               # superuser CAN write
 
 ---
 
-## 7. The change feed
+### 7. The change feed
 
 Every insert / update / soft-delete — from the API, the scheduler, batch, or simulate — writes one entry to an append-only log. The cursor is the per-config monotonic **`version`** (not a timestamp).
 
-### 7.1 Read it
+#### 7.1 Read it
 
 ```python
 pp(pv("GET", f"/v1/configs/{OID}/changes", params={"since": 0, "limit": 3}).json())
@@ -1062,7 +1270,7 @@ pp(pv("GET", f"/v1/configs/{OID}/changes", params={"since": 0, "limit": 3}).json
 
 `since` ≥ 0, `limit` 1–500 (default 100). Poll with `since=<last next_cursor>`.
 
-### 7.2 Drain it and resume later
+#### 7.2 Drain it and resume later
 
 ```python
 cursor = 0
@@ -1076,7 +1284,7 @@ while True:
 print(f"resume later with since={cursor}")
 ```
 
-### 7.3 Prove inserts, updates and deletes are all recorded, in order
+#### 7.3 Prove inserts, updates and deletes are all recorded, in order
 
 ```python
 cur = pv("GET", f"/v1/configs/{OID}/changes", params={"since": 0, "limit": 1}).json()["latest_version"]
@@ -1090,7 +1298,7 @@ for c in changes:
 # 3 consecutive versions: insert, update, delete
 ```
 
-### 7.4 Stale cursor
+#### 7.4 Stale cursor
 
 ```python
 r = pv("GET", f"/v1/configs/{OID}/changes", params={"since": 99999999})
@@ -1098,7 +1306,7 @@ pp(r.json().get("error"))
 # 409 cursor_ahead_of_source — restart from since=0
 ```
 
-### 7.5 Things to be aware of
+#### 7.5 Things to be aware of
 
 - Each entry carries the row's **current** values, not a point-in-time snapshot.
 - A row wiped by `replace`/`reset` appears with **only its primary key**.
@@ -1106,7 +1314,7 @@ pp(r.json().get("error"))
 
 ---
 
-## 8. Batch generation (append / replace / reset)
+### 8. Batch generation (append / replace / reset)
 
 `POST /v1/configs/{id}/batch` **[P-owner/SU]** bulk-creates rows, or refreshes the dataset.
 
@@ -1118,7 +1326,7 @@ pp(r.json().get("error"))
 | `seed`       | integer; same seed + same request = same ids, values and relationships (timestamps and versions are **not** pinned) |
 | `confirm`    | must be `true` for `replace` and `reset` (they delete data)                                                         |
 
-### 8.1 Append
+#### 8.1 Append
 
 ```python
 r = pv("POST", f"/v1/configs/{OID}/batch", headers=JSON, json={"count": 5, "seed": 123})
@@ -1126,7 +1334,7 @@ pp(r.json())
 # entities[0].inserted == 5
 ```
 
-### 8.2 Same seed ⇒ identical data
+#### 8.2 Same seed ⇒ identical data
 
 ```python
 # publish two empty configs, batch both with seed=42 → identical names
@@ -1134,7 +1342,7 @@ pp(r.json())
 
 Reusing a seed on a live table that already has matching PKs → `409 duplicate_primary_key`.
 
-### 8.3 Replace (needs confirm; refreshes dependents)
+#### 8.3 Replace (needs confirm; refreshes dependents)
 
 ```python
 r = pv("POST", f"/v1/configs/{CID}/batch", headers=JSON, json={"mode": "replace"})
@@ -1147,7 +1355,7 @@ pp(r.json())
 # auto_included includes child config names; total_rows reflect new counts
 ```
 
-### 8.4 Reset (restarts versions)
+#### 8.4 Reset (restarts versions)
 
 ```python
 r = pv("POST", f"/v1/configs/{OID}/batch", headers=JSON, json={
@@ -1157,7 +1365,7 @@ feed = pv("GET", f"/v1/configs/{OID}/changes", params={"since": 0}).json()["chan
 print(len(feed), min(c["version"] for c in feed))   # 2, 1
 ```
 
-### 8.5 Validation / quotas
+#### 8.5 Validation / quotas
 
 ```python
 print(pv("POST", f"/v1/configs/{OID}/batch", headers=JSON, json={"mode": "bogus"}).status_code)   # 422
@@ -1166,7 +1374,7 @@ print(pv("POST", f"/v1/configs/{OID}/batch", headers=JSON, json={"count": -1}).s
 
 ---
 
-## 9. Simulate (inserts + updates + deletes on demand)
+### 9. Simulate (inserts + updates + deletes on demand)
 
 ```python
 r = pv("POST", f"/v1/configs/{OID}/simulate", headers=JSON, json={
@@ -1184,7 +1392,7 @@ Notes: clamping is explained in `notes[]` with your config names. Configs withou
 
 ---
 
-## 10. The scheduler
+### 10. The scheduler
 
 Each published config gets a background job. Cadence comes from `update_schedule.cadence` (hourly/daily/weekly). PATCH that merges and **reschedules live**.
 
@@ -1198,7 +1406,7 @@ To force a tick without waiting: use `simulate` with an empty body, or the inter
 
 ---
 
-## 11. Failure injection
+### 11. Failure injection
 
 ```python
 # hard-fail every row read
@@ -1231,9 +1439,11 @@ Built-in `support_tickets` ships with `fail_rate: 0.02` — occasional 500s on l
 
 ---
 
-## 12. Export (snapshot, delta, zip bundle)
+## Part 5 — Getting the data out
 
-### 12.1 Snapshots
+### 12. Export (snapshot, delta, zip bundle)
+
+#### 12.1 Snapshots
 
 ```python
 r = pv("GET", f"/v1/configs/{OID}/export")
@@ -1250,7 +1460,7 @@ r = pv("GET", f"/v1/configs/{OID}/export", params={"include_deleted": "true"})
 print("with deleted lines:", len(r.text.splitlines()))
 ```
 
-### 12.2 Delta files
+#### 12.2 Delta files
 
 ```python
 snap = pv("GET", f"/v1/configs/{OID}/export", params={"format": "ndjson"})
@@ -1271,7 +1481,7 @@ print(pv("GET", f"/v1/configs/{OID}/export", params={"since": 0, "format": "sql"
 print(pv("GET", f"/v1/configs/{OID}/export", params={"format": "xml"}).status_code)  # 422
 ```
 
-### 12.3 Zip bundle
+#### 12.3 Zip bundle
 
 ```python
 import io
@@ -1310,7 +1520,7 @@ for f in manifest["files"]:
 
 ---
 
-## 13. DDL export
+### 13. DDL export
 
 ```python
 r = pv("GET", f"/v1/configs/{OID}/ddl")
@@ -1333,7 +1543,7 @@ Legacy (superuser): `su("GET", "/ddl", params={"dialect": "postgresql", "include
 
 ---
 
-## 14. Metrics and job runs
+### 14. Metrics and job runs
 
 ```python
 pp(pv("GET", f"/v1/configs/{OID}/metrics").json())
@@ -1350,9 +1560,11 @@ pp(su("GET", "/scheduler/runs", params={"entity": "orders", "limit": 5}).json())
 
 ---
 
-## 15. Sharing & isolation between providers
+## Part 6 — Multi-tenancy & superuser powers
 
-### 15.1 Public config: Bob reads, Bob cannot write
+### 15. Sharing & isolation between providers
+
+#### 15.1 Public config: Bob reads, Bob cannot write
 
 ```python
 shared = pv2("GET", "/v1/configs", params={"scope": "shared"}).json()["items"]
@@ -1395,7 +1607,7 @@ sweep(KEY2, OID)
 # GETs → 200 (except missing row 404); writes → 403
 ```
 
-### 15.2 Private config: invisible to everyone but owner and superuser
+#### 15.2 Private config: invisible to everyone but owner and superuser
 
 ```python
 pv("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"is_only_me": True})
@@ -1405,7 +1617,7 @@ sweep(SU, OID)     # superuser still sees it
 pv("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"is_only_me": False})
 ```
 
-### 15.3 Tenants never meet
+#### 15.3 Tenants never meet
 
 ```python
 # same name, two providers, separate data — allowed
@@ -1452,7 +1664,7 @@ text = pv("GET", f"/v1/configs/{OID}/ddl").text + pv("GET", f"/v1/configs/{OID}/
 assert not NAMESPACED.search(text)
 ```
 
-### 15.4 Built-in examples as seen by a provider
+#### 15.4 Built-in examples as seen by a provider
 
 ```python
 for i in pv("GET", "/v1/configs", params={"scope": "shared"}).json()["items"]:
@@ -1464,7 +1676,7 @@ print(pv("POST", "/v1/configs/cfg_sys_orders/data", headers=JSON, json={}).statu
 print(su("POST", "/v1/configs/cfg_sys_orders/data", headers=JSON, json={}).status_code)  # 201
 ```
 
-### 15.5 Superuser powers over provider data
+#### 15.5 Superuser powers over provider data
 
 ```python
 print(len(su("GET", "/v1/configs", params={"scope": "all"}).json()["items"]))
@@ -1473,7 +1685,7 @@ su("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"update_schedule": {"caden
 pv("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"update_schedule": {"cadence": "hourly"}})  # restore
 ```
 
-### 15.6 Deactivated provider
+#### 15.6 Deactivated provider
 
 ```python
 su("PATCH", f"/v1/admin/providers/{B_ID}", headers=JSON, json={"is_active": False})
@@ -1484,11 +1696,11 @@ su("PATCH", f"/v1/admin/providers/{B_ID}", headers=JSON, json={"is_active": True
 
 ---
 
-## 16. Superuser-only legacy routes (built-in entities)
+### 16. Superuser-only legacy routes (built-in entities)
 
 These serve the three **built-in YAML entities** and global admin tools. They need a **superuser** key; a provider key gets **`403`** on every one.
 
-### 16.1 CRUD on a built-in entity
+#### 16.1 CRUD on a built-in entity
 
 ```python
 pp(su("GET", "/orders", params={"limit": 3}).json())
@@ -1502,7 +1714,7 @@ pp(su("GET", "/orders/changes", params={"since": 0, "limit": 3}).json())
 print(list(su("GET", "/entities").json().keys()))
 ```
 
-### 16.2 Admin batch
+#### 16.2 Admin batch
 
 ```python
 pp(su("POST", "/admin/batch", headers=JSON, json={
@@ -1521,7 +1733,7 @@ pp(su("POST", "/admin/batch", headers=JSON, json={
 }).json())
 ```
 
-### 16.3 Admin changes
+#### 16.3 Admin changes
 
 ```python
 pp(su("POST", "/admin/changes", headers=JSON, json={
@@ -1530,7 +1742,7 @@ pp(su("POST", "/admin/changes", headers=JSON, json={
 pp(su("POST", "/admin/changes", headers=JSON, json={}).json())  # one default tick for every entity
 ```
 
-### 16.4 Legacy export & DDL
+#### 16.4 Legacy export & DDL
 
 ```python
 print(su("GET", "/orders/export", params={"format": "csv"}).text.splitlines()[:3])
@@ -1540,7 +1752,7 @@ Path("export.zip").write_bytes(r.content)
 print(su("GET", "/ddl", params={"dialect": "postgresql", "include_system": "true"}).text[:500])
 ```
 
-### 16.5 Provider keys are locked out of all of it
+#### 16.5 Provider keys are locked out of all of it
 
 ```python
 for p in ["/entities", "/metrics", "/scheduler/runs?entity=orders", "/orders?limit=1", "/customers", "/ddl", "/export"]:
@@ -1558,7 +1770,9 @@ st("GET", "/health")  # 200
 
 ---
 
-## 17. CLI (no server needed)
+## Part 7 — Tooling & operations
+
+### 17. CLI (no server needed)
 
 The CLI talks **directly to the database** named by `DATABASE_URL`. It works on the **built-in YAML entities**; provider-published configs are managed only through `/v1`. It bypasses HTTP auth entirely.
 
@@ -1591,40 +1805,9 @@ Checks:
 
 ---
 
-## 18. Error reference
+### 19. Restart, Postgres, Docker, pytest
 
-Every failure uses one envelope: `{"error":{"code":"…","message":"…"}}` (a validation error's `message` is a list).
-
-| Code                                                                                               |      HTTP       | When                                                                                                                                                 |
-| -------------------------------------------------------------------------------------------------- | :-------------: | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `unauthorized`                                                                                     |       401       | missing / wrong / revoked key, inactive provider (adds `WWW-Authenticate: ApiKey`)                                                                   |
-| `forbidden`                                                                                        |       403       | provider key on a superuser/legacy route · write to someone else's config · creating a config for another provider                                   |
-| `not_found`                                                                                        |       404       | unknown **or private** config · row missing or soft-deleted · unknown provider/key · unknown entity on `/scheduler/runs`                             |
-| `validation_error`                                                                                 |       422       | bad query/body shape (e.g. `limit=0`, `mode=bogus`, `format=xml`, missing `entity`)                                                                  |
-| `invalid_config`                                                                                   |       422       | a config (or body) failed validation — the message says exactly why                                                                                  |
-| `invalid_request`                                                                                  |       422       | bad `PATCH` body · empty `configs` in a bundle                                                                                                       |
-| `invalid_provider` / `invalid_label`                                                               |       422       | bad `full_name` / key label                                                                                                                          |
-| `payload_too_large`                                                                                |       413       | config body over `MAX_CONFIG_BYTES`                                                                                                                  |
-| `already_exists`                                                                                   |       409       | config name already used by this owner                                                                                                               |
-| `quota_exceeded`                                                                                   |    409 / 422    | too many configs (**409**) · too many rows (**422**)                                                                                                 |
-| `managed_by_yaml`                                                                                  |       409       | edit/delete of a built-in config                                                                                                                     |
-| `has_dependents`                                                                                   |       409       | change fields of / delete a config others reference                                                                                                  |
-| `confirmation_required`                                                                            |       400       | delete config · change fields · `replace`/`reset` without confirm                                                                                    |
-| `missing_parent_rows`                                                                              |       409       | a child has no parent rows to point at                                                                                                               |
-| `busy`                                                                                             |       409       | another bulk write held the lock > 30 s                                                                                                              |
-| `not_supported`                                                                                    | 400 / 409 / 422 | row delete on a config with no soft-delete field (400) · modifying the system provider (409) · `deletes` in simulate with no soft-delete field (422) |
-| `unknown_field` · `read_only_field` · `invalid_value` · `invalid_reference`                        |       422       | row write validation (`/v1`)                                                                                                                         |
-| `cursor_ahead_of_source`                                                                           |       409       | `since` is beyond the latest version (usually after `reset`)                                                                                         |
-| `duplicate_primary_key`                                                                            |       409       | a seeded insert generated a key that already exists — use a different seed                                                                           |
-| `unsupported_format` · `invalid_since` · `since_not_targeted` · `mixed_owners`                     |       422       | export request problems                                                                                                                              |
-| `unknown_entity` · `counts_not_targeted` · `invalid_mode` · `invalid_batch_size` · `invalid_count` |       422       | legacy `/admin/*` & CLI request problems                                                                                                             |
-| `injected_failure`                                                                                 |       500       | failure injection fired                                                                                                                              |
-
----
-
-## 19. Restart, Postgres, Docker, pytest
-
-### 19.1 Startup failure modes
+#### 19.1 Startup failure modes
 
 | Start with                                                                 | Expect                                                 |
 | -------------------------------------------------------------------------- | ------------------------------------------------------ |
@@ -1633,14 +1816,14 @@ Every failure uses one envelope: `{"error":{"code":"…","message":"…"}}` (a v
 | no key at all                                                              | starts, logs "authentication is DISABLED"              |
 | a YAML in `configs/` with an unknown type, dangling `ref` or circular refs | exits with a clear message naming the file / entity    |
 
-### 19.2 Everything survives a restart
+#### 19.2 Everything survives a restart
 
 1. Create a provider, publish a **private** config (`is_only_me: true`), note the key and config id.
 2. Stop the server, start it again (same `DATABASE_URL`, same superuser key).
 3. Verify: `st("GET", "/v1/me", key=KEY)` → `200` · rows intact · superuser still reads the private config · unknown key still → `401` · writes still work.
 4. Providers, hashed keys, configs and data persist. The config's scheduler job is re-registered.
 
-### 19.3 PostgreSQL
+#### 19.3 PostgreSQL
 
 ```python
 # Terminal:
@@ -1649,7 +1832,7 @@ Every failure uses one envelope: `{"error":{"code":"…","message":"…"}}` (a v
 # Repeat the smoke test (§20).
 ```
 
-### 19.4 Docker (API + Postgres)
+#### 19.4 Docker (API + Postgres)
 
 ```python
 # Terminal:
@@ -1658,7 +1841,7 @@ Every failure uses one envelope: `{"error":{"code":"…","message":"…"}}` (a v
 #   requests.get("http://localhost:8000/health")
 ```
 
-### 19.5 Automated tests (310 tests)
+#### 19.5 Automated tests (310 tests)
 
 ```python
 # Terminal:
@@ -1672,7 +1855,7 @@ Every failure uses one envelope: `{"error":{"code":"…","message":"…"}}` (a v
 
 ---
 
-## 20. One-shot smoke-test script
+### 20. One-shot smoke-test script
 
 Save as `smoke_test.py`, then run: `SU=<superuser key> python smoke_test.py`. Requires `requests` and a server **with a superuser key set**. It creates two providers (providers can't be deleted — the script deactivates them at the end) and cleans up its own configs.
 
@@ -1868,11 +2051,44 @@ sys.exit(FAIL)
 
 ---
 
-## 21. Master checklist
+## Part 8 — Reference, checklist & wrap-up
+
+### 18. Error reference
+
+Every failure uses one envelope: `{"error":{"code":"…","message":"…"}}` (a validation error's `message` is a list).
+
+| Code                                                                                               |      HTTP       | When                                                                                                                                                 |
+| -------------------------------------------------------------------------------------------------- | :-------------: | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unauthorized`                                                                                     |       401       | missing / wrong / revoked key, inactive provider (adds `WWW-Authenticate: ApiKey`)                                                                   |
+| `forbidden`                                                                                        |       403       | provider key on a superuser/legacy route · write to someone else's config · creating a config for another provider                                   |
+| `not_found`                                                                                        |       404       | unknown **or private** config · row missing or soft-deleted · unknown provider/key · unknown entity on `/scheduler/runs`                             |
+| `validation_error`                                                                                 |       422       | bad query/body shape (e.g. `limit=0`, `mode=bogus`, `format=xml`, missing `entity`)                                                                  |
+| `invalid_config`                                                                                   |       422       | a config (or body) failed validation — the message says exactly why                                                                                  |
+| `invalid_request`                                                                                  |       422       | bad `PATCH` body · empty `configs` in a bundle                                                                                                       |
+| `invalid_provider` / `invalid_label`                                                               |       422       | bad `full_name` / key label                                                                                                                          |
+| `payload_too_large`                                                                                |       413       | config body over `MAX_CONFIG_BYTES`                                                                                                                  |
+| `already_exists`                                                                                   |       409       | config name already used by this owner · provider `full_name` already taken (create or rename)                              |
+| `quota_exceeded`                                                                                   |    409 / 422    | too many configs (**409**) · too many rows (**422**)                                                                                                 |
+| `managed_by_yaml`                                                                                  |       409       | edit/delete of a built-in config                                                                                                                     |
+| `has_dependents`                                                                                   |       409       | change fields of / delete a config others reference                                                                                                  |
+| `confirmation_required`                                                                            |       400       | delete config · change fields · `replace`/`reset` without confirm                                                                                    |
+| `missing_parent_rows`                                                                              |       409       | a child has no parent rows to point at                                                                                                               |
+| `busy`                                                                                             |       409       | another bulk write held the lock > 30 s                                                                                                              |
+| `not_supported`                                                                                    | 400 / 409 / 422 | row delete on a config with no soft-delete field (400) · modifying the system provider (409) · `deletes` in simulate with no soft-delete field (422) |
+| `unknown_field` · `read_only_field` · `invalid_value` · `invalid_reference`                        |       422       | row write validation (`/v1`)                                                                                                                         |
+| `cursor_ahead_of_source`                                                                           |       409       | `since` is beyond the latest version (usually after `reset`)                                                                                         |
+| `duplicate_primary_key`                                                                            |       409       | a seeded insert generated a key that already exists — use a different seed                                                                           |
+| `unsupported_format` · `invalid_since` · `since_not_targeted` · `mixed_owners`                     |       422       | export request problems                                                                                                                              |
+| `unknown_entity` · `counts_not_targeted` · `invalid_mode` · `invalid_batch_size` · `invalid_count` |       422       | legacy `/admin/*` & CLI request problems                                                                                                             |
+| `injected_failure`                                                                                 |       500       | failure injection fired                                                                                                                              |
+
+---
+
+### 21. Master checklist
 
 Tick each box as you verify it. **Section** points back to the details above.
 
-### Setup & auth
+#### Setup & auth
 
 - [ ] Server starts, seeds 30 / 50 / 20 rows, `/health` is open (§1)
 - [ ] Missing / wrong / empty key → 401 envelope + `WWW-Authenticate` (§3.2)
@@ -1883,7 +2099,7 @@ Tick each box as you verify it. **Section** points back to the details above.
 - [ ] Superuser key rotation with `API_KEYS=new,old` (§3.7)
 - [ ] `ENABLE_DOCS=false` hides docs, `/health` stays open (§3.8)
 
-### Providers & keys
+#### Providers & keys
 
 - [ ] Create provider via API; key shown once; name validation (§4.1)
 - [ ] Create provider via CLI; key works on the running server (§4.2)
@@ -1894,7 +2110,7 @@ Tick each box as you verify it. **Section** points back to the details above.
 - [ ] Provider key gets 403 on every `/v1/admin/*` route (§4.8)
 - [ ] Only a SHA-256 of keys is stored (§4.9)
 
-### Configs
+#### Configs
 
 - [ ] Validate dry-run saves nothing (§5.4)
 - [ ] Publish via **YAML** body, via **JSON** body, and as superuser for a provider (§5.5, 5.12)
@@ -1908,7 +2124,7 @@ Tick each box as you verify it. **Section** points back to the details above.
 - [ ] Quotas enforced (§5.11)
 - [ ] Built-in YAML: add `configs/<name>.yaml`, restart, it appears as `cfg_sys_<name>` (§5.3-A)
 
-### Rows (CRUD)
+#### Rows (CRUD)
 
 - [ ] Create: empty / partial / pinned ref (§6.1)
 - [ ] List + keyset pagination covers every row once; `limit` bounds (§6.2)
@@ -1918,7 +2134,7 @@ Tick each box as you verify it. **Section** points back to the details above.
 - [ ] Row validation matrix (unknown / read-only / type / enum / null / ref) (§6.6)
 - [ ] Non-owner read OK, write 403; superuser writes anywhere (§6.7)
 
-### Feed, generation, scheduler
+#### Feed, generation, scheduler
 
 - [ ] Change feed: insert → update → delete in order; paging; resume cursor (§7)
 - [ ] Stale cursor → 409 (§7.4, 8.4)
@@ -1930,7 +2146,7 @@ Tick each box as you verify it. **Section** points back to the details above.
 - [ ] Scheduler tick via snippet writes a run row; schedule edit is live (§10)
 - [ ] `metrics` / `runs` show `last_status` (§10.3, §14)
 
-### Failure injection, export, DDL
+#### Failure injection, export, DDL
 
 - [ ] `fail_rate=1` → 500 `injected_failure`; `/changes` & `/export` unaffected; recover (§11.1)
 - [ ] Probabilistic failures; built-in `support_tickets` 2 % (§11.2, 11.3)
@@ -1940,7 +2156,7 @@ Tick each box as you verify it. **Section** points back to the details above.
 - [ ] Bundle error cases (§12.3)
 - [ ] DDL: parents first, `include_parents=false`, postgres dialect, no internal names (§13)
 
-### Isolation & superuser
+#### Isolation & superuser
 
 - [ ] Bob: public config → reads 200 / writes 403 on every route (§15.1)
 - [ ] Private config → 404 everywhere for Bob; owner + superuser unaffected (§15.2)
@@ -1951,7 +2167,7 @@ Tick each box as you verify it. **Section** points back to the details above.
 - [ ] Every legacy route → 403 for provider keys (§16.5)
 - [ ] Legacy CRUD, `/admin/batch`, `/admin/changes`, `/export`, `/ddl` (§16)
 
-### CLI, ops
+#### CLI, ops
 
 - [ ] All CLI commands incl. `--yes` guard and exit codes (§17)
 - [ ] Restart persistence (§19.2); PostgreSQL run (§19.3); Docker run (§19.4)
@@ -1960,7 +2176,7 @@ Tick each box as you verify it. **Section** points back to the details above.
 
 ---
 
-## 22. Gotchas worth knowing
+### 22. Gotchas worth knowing
 
 **From the README (deliberate limitations)**
 
@@ -1987,3 +2203,5 @@ Tick each box as you verify it. **Section** points back to the details above.
 - `GET /v1/configs/{id}` returns the **full definition** (including `failure_injection`) to any provider who can read the config.
 - Unknown keys in a built-in `configs/*.yaml` file are not rejected the way they are for API-published configs.
 - The **`MAX_ROWS_PER_CONFIG` row cap applies to provider configs only** — built-in YAML configs have none (`max_rows: null` in their metrics).
+
+---
