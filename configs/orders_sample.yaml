@@ -1,0 +1,43 @@
+entity: orders
+
+fields:
+  order_id:
+    type: uuid
+    primary_key: true
+  customer_id:
+    type: ref
+    ref_entity: customers
+  amount:
+    type: float
+    min: 10
+    max: 500
+  status:
+    type: enum
+    values: [pending, shipped, cancelled]
+  created_at:
+    type: timestamp
+    auto: created
+  updated_at:
+    type: timestamp
+    auto: updated
+  deleted_at:
+    type: timestamp
+    nullable: true
+    auto: soft_delete
+  version:
+    type: int
+    auto: version
+
+seed:
+  initial_count: 50
+
+update_schedule:
+  cadence: hourly
+  new_records: [5, 15]
+  mutate_existing_pct: 5
+  soft_delete_pct: 1
+  jitter_seconds: 30
+
+failure_injection:
+  fail_rate: 0.0
+  latency_ms: 0

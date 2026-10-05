@@ -1,0 +1,42 @@
+entity: customers
+
+fields:
+  customer_id:
+    type: uuid
+    primary_key: true
+  name:
+    type: string
+    key_label: full_name # real-looking names via iki-data-generator instead of random letters
+  email:
+    type: string
+    key_label: email_address
+  segment:
+    type: enum
+    values: [retail, wholesale, enterprise]
+  created_at:
+    type: timestamp
+    auto: created
+  updated_at:
+    type: timestamp
+    auto: updated
+  deleted_at:
+    type: timestamp
+    nullable: true
+    auto: soft_delete
+  version:
+    type: int
+    auto: version
+
+seed:
+  initial_count: 30
+
+update_schedule:
+  cadence: hourly
+  new_records: [1, 5]
+  mutate_existing_pct: 5
+  soft_delete_pct: 1
+  jitter_seconds: 30
+
+failure_injection:
+  fail_rate: 0.0
+  latency_ms: 0
