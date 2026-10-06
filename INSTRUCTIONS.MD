@@ -6,6 +6,8 @@ Everything here was derived from the source code and README. Where something is 
 
 **All interactive examples below use Python (`requests`) instead of curl/bash.**
 
+**Every step that creates state is written to be re-runnable (idempotent).** Run the guide top to bottom, stop half-way, run it again tomorrow against the same database — providers, keys and configs are found and reused instead of failing with `409 already_exists`. How that works, and how to start over, is in [0.2](#02-idempotent-run-process).
+
 ---
 
 ## How to use this guide
@@ -17,32 +19,35 @@ the one section you need.
 
 **Set up the shared helpers first.** [0. Before you start](#0-before-you-start)
 defines `pv`, `su`, `st`, `pp` and the `BASE` / `SU` / `KEY` / `KEY2` / `CID` /
-`OID` placeholders. Every snippet from Part 2 onward assumes they exist, so do
-not skip it.
+`OID` placeholders, plus the idempotent helpers (`ensure_provider`,
+`ensure_config`, `ensure_row`, `baseline_data`, `teardown`). Every snippet from
+Part 2 onward assumes they exist, so do not skip it. [0.2](#02-idempotent-run-process)
+explains the re-run contract.
 
 ### Suggested reading paths
 
 | If you are… | Read, in order |
 |---|---|
-| A **new tester**, first pass | Quick start → 0 → 1 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 21 |
+| A **new tester**, first pass | 0 → Quick start → 1 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 21 |
 | Testing **permissions / multi-tenancy** | 2 (roles) → 3 (auth) → 4 (keys) → 15 (isolation) → 16 (legacy) |
 | Testing **data generation** | 5 (configs) → 8 (batch) → 9 (simulate) → 10 (scheduler) → 11 (failures) |
 | Testing **export / DDL / metrics** | 12 (export) → 13 (DDL) → 14 (metrics) |
 | An **operator** (deploy, Docker, CI) | 1 (install) → 17 (CLI) → 19 (Postgres/Docker/pytest) → 20 (smoke test) |
+| **Re-running** the guide on a database that already has data | 0.2 (idempotent run process) → any section |
 | Looking something **up** | 18 (error reference) → 22 (gotchas) |
 
 ### What is in each part
 
 | Part | Sections | Covers |
 |---|---|---|
-| 1 | Quick start, 0 | The five-minute path; tools, placeholders, shared helpers |
+| 1 | 0, Quick start | Tools, placeholders, shared idempotent helpers, the re-run contract (0.2); then the five-minute path |
 | 2 | 1–4 | Install & env vars, roles, authentication, providers and API keys |
 | 3 | 5 | Configs: anatomy, validation, publish, edit, delete, dependencies |
 | 4 | 6–11 | Rows: CRUD, change feed, batch, simulate, scheduler, failure injection |
 | 5 | 12–14 | Snapshot / delta / zip export, DDL export, metrics and job runs |
 | 6 | 15–16 | Sharing & isolation between providers; superuser-only legacy routes |
-| 7 | 17, 19, 20 | CLI, restart / PostgreSQL / Docker / pytest, one-shot smoke test |
-| 8 | 18, 21, 22 | Error envelope reference, master checklist, gotchas |
+| 7 | 17–20 | CLI, error envelope reference, restart / PostgreSQL / Docker / pytest, one-shot smoke test |
+| 8 | 21, 22 | Master checklist, gotchas |
 
 ### Conventions used throughout
 
@@ -52,6 +57,7 @@ not skip it.
 - `pp(...)` pretty-prints; `pv` / `su` / `st` are thin wrappers over `requests`.
 - Section numbers are stable — `§5.7` always means subsection 5.7 wherever you see it.
 - A `#` at the start of a line inside a snippet is a comment, not a step to run.
+- `ensure_*`, `drop_config` and `baseline_data` are the **idempotent** building blocks ([0.2](#02-idempotent-run-process)). A step marked **(append-only)** adds data every time it runs; run `baseline_data(...)` to put the data back.
 
 ---
 
@@ -59,8 +65,8 @@ not skip it.
 
 **Part 1 — Orientation: your first five minutes**
 
+  - [0. Before you start](#0-before-you-start) (helpers · [0.2 idempotent run process](#02-idempotent-run-process))
   - [Quick start (5 minutes)](#quick-start-5-minutes)
-  - [0. Before you start](#0-before-you-start)
 
 **Part 2 — Install, access & identity**
 
@@ -93,106 +99,46 @@ not skip it.
   - [15. Sharing & isolation between providers](#15-sharing--isolation-between-providers)
   - [16. Superuser-only legacy routes (built-in entities)](#16-superuser-only-legacy-routes-built-in-entities)
 
-**Part 7 — Tooling & operations**
+**Part 7 — Tooling, operations & reference**
 
   - [17. CLI (no server needed)](#17-cli-no-server-needed)
+  - [18. Error reference](#18-error-reference)
   - [19. Restart, Postgres, Docker, pytest](#19-restart-postgres-docker-pytest)
   - [20. One-shot smoke-test script](#20-one-shot-smoke-test-script)
 
-**Part 8 — Reference, checklist & wrap-up**
+**Part 8 — Checklist & wrap-up**
 
-  - [18. Error reference](#18-error-reference)
   - [21. Master checklist](#21-master-checklist)
   - [22. Gotchas worth knowing](#22-gotchas-worth-knowing)
 
 ## Part 1 — Orientation: your first five minutes
 
-### Quick start (5 minutes)
-
-The shortest path from nothing to "I created an API key, published a YAML config and read generated data".
-
-```python
-# 1. Install (run once in a terminal)
-#    python -m venv .venv && source .venv/bin/activate
-#    pip install -r requirements.txt
-#    pip install requests   # for the examples in this guide
-
-# 2. Make the SUPERUSER key and start the server (terminal)
-#    import subprocess, os
-#    key = subprocess.check_output(["python", "-m", "app.cli", "genkey"], text=True).strip()
-#    os.environ["API_KEY"] = key
-#    print("SUPERUSER KEY:", key)   # keep it
-#    # then: uvicorn app.main:app --reload
-
-import json
-from pathlib import Path
-import requests
-
-BASE = "http://127.0.0.1:8000"
-SU = "<the superuser key from step 2>"   # replace
-
-# 3. Create a PROVIDER + its API key  -> shown ONCE
-r = requests.post(
-    f"{BASE}/v1/admin/providers",
-    headers={"X-API-Key": SU, "Content-Type": "application/json"},
-    json={"full_name": "Acme Data Team"},
-)
-r.raise_for_status()
-provider = r.json()
-print(json.dumps(provider, indent=2))
-KEY = provider["api_key"]   # shown once — store it
-
-# 4. Publish a config (YAML straight from the configs/ folder)
-yaml_body = Path("configs/customers.yaml").read_text()
-r = requests.post(
-    f"{BASE}/v1/configs",
-    headers={"X-API-Key": KEY, "Content-Type": "text/yaml"},
-    data=yaml_body,
-)
-r.raise_for_status()
-config = r.json()
-print(json.dumps(config, indent=2))
-CID = config["id"]
-
-# 5. Read the generated data and its change feed
-data = requests.get(
-    f"{BASE}/v1/configs/{CID}/data",
-    headers={"X-API-Key": KEY},
-    params={"limit": 5},
-).json()
-print(json.dumps(data, indent=2))
-
-changes = requests.get(
-    f"{BASE}/v1/configs/{CID}/changes",
-    headers={"X-API-Key": KEY},
-    params={"since": 0, "limit": 5},
-).json()
-print(json.dumps(changes, indent=2))
-```
-
-If step 4 returned `"seeded_rows": 30` you are done with the basics. The rest of this document tests everything else.
-
----
-
 ### 0. Before you start
 
 **Tools:** Python 3.10+, `requests`. Optional: `sqlite3` CLI, `psql`, a zip library (stdlib `zipfile`). You can still use the Swagger UI (see [3.4](#34-swagger-ui-authorize-button)).
 
-**Placeholders:** `<like-this>` means "replace me". `BASE`, `SU`, `KEY`, `KEY2`, `CID`, `OID` are variables used throughout.
+**Placeholders:** `<like-this>` means "replace me". `BASE`, `SU`, `KEY`, `KEY2`, `CID`, `OID` (plus `A_ID`, `B_ID`, `TID`, `SID`) are variables used throughout.
 
-**Paste this helper block once** — it keeps every later example short:
+**Paste this helper block once** — it keeps every later example short, and it holds the
+idempotent layer (`ensure_*`, `drop_config`, `baseline_data`, `teardown`). The superuser key is read from the
+`API_KEY` (or `SU`) environment variable — export it before starting Jupyter, or edit `SU` by hand.
 
 ```python
 import json
+import os
+import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional, Tuple
 
 import requests
 
-BASE = "http://127.0.0.1:8000"
-SU = "<superuser key>"          # from API_KEY / API_KEYS
-KEY = "<provider A key>"        # filled in section 4
-KEY2 = "<provider B key>"       # filled in section 4
+BASE = os.environ.get("BASE", "http://127.0.0.1:8000")
+SU = os.environ.get("API_KEY") or os.environ.get("SU") or "<superuser key>"
+STATE_FILE = Path(os.environ.get("STATE_FILE", ".synthetic_state.json"))  # holds API keys: git-ignore it
+
+KEY = KEY2 = None                  # provider A / B keys, filled by ensure_provider()
+A_ID = B_ID = None
+CID = OID = TID = None             # acme_customers / acme_orders / acme_tickets config ids
 
 JSON = {"Content-Type": "application/json"}
 YAML = {"Content-Type": "text/yaml"}
@@ -233,6 +179,181 @@ def st(method: str, path: str, key: Optional[str] = None, **kwargs) -> int:
 def pp(obj: Any) -> None:
     """Pretty-print JSON."""
     print(json.dumps(obj, indent=2, default=str))
+
+
+# ------------------------------------------------------------ idempotent layer ----
+def _norm(name: str) -> str:
+    return " ".join(name.split()).casefold()          # same rule the server uses for provider names
+
+
+def _load_state() -> dict:
+    return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {"providers": {}}
+
+
+def _save_state(state: dict) -> None:
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+    try:
+        os.chmod(STATE_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def key_works(key: Optional[str]) -> bool:
+    return bool(key) and requests.get(f"{BASE}/v1/me", headers=_headers(key)).status_code == 200
+
+
+def ensure_provider(full_name: str) -> dict:
+    """Find-or-create a provider and make sure we hold a WORKING key for it.
+
+    Returns {"id", "api_key", "key_id", "created"}. Safe to run any number of times:
+      * provider exists            -> reused (reactivated if it was deactivated)
+      * saved key still works      -> reused
+      * key lost / revoked         -> ONE new key is issued and saved
+    A provider's secret is shown only once, so it is kept in STATE_FILE.
+    """
+    state = _load_state()
+    norm = _norm(full_name)
+    saved = state["providers"].get(norm, {})
+
+    providers = su("GET", "/v1/admin/providers").json()["items"]
+    prov = next((p for p in providers if p["id"] == saved.get("id")), None) \
+        or next((p for p in providers if _norm(p["full_name"]) == norm), None)
+
+    created, key, key_id = False, None, None
+    if prov is None:
+        r = su("POST", "/v1/admin/providers", headers=JSON, json={"full_name": full_name})
+        r.raise_for_status()
+        prov = r.json()
+        key, key_id, created = prov["api_key"], prov["key"]["id"], True
+    else:
+        if not prov.get("is_active", True):
+            su("PATCH", f"/v1/admin/providers/{prov['id']}", headers=JSON, json={"is_active": True}).raise_for_status()
+        key = saved.get("api_key") if saved.get("id") == prov["id"] else None
+        if not key_works(key):
+            r = su("POST", f"/v1/admin/providers/{prov['id']}/keys", headers=JSON, json={"label": "idempotent-run"})
+            r.raise_for_status()
+            key, key_id = r.json()["api_key"], r.json()["key"]["id"]
+        else:
+            key_id = next((k["id"] for k in prov.get("keys", []) if key.startswith(k["key_prefix"])
+                           and not k.get("revoked_at")), None)
+
+    state["providers"][norm] = {"id": prov["id"], "api_key": key}
+    _save_state(state)
+    return {"id": prov["id"], "api_key": key, "key_id": key_id, "created": created}
+
+
+def remember_key(provider_id: str, key: str) -> None:
+    """Store a new working key for a provider (after you rotate it by hand)."""
+    state = _load_state()
+    for entry in state["providers"].values():
+        if entry["id"] == provider_id:
+            entry["api_key"] = key
+    _save_state(state)
+
+
+def rotate_key(provider_id: str, label: str = "ci") -> str:
+    """Converge to exactly ONE active key: issue a new one, revoke every other active key."""
+    r = su("POST", f"/v1/admin/providers/{provider_id}/keys", headers=JSON, json={"label": label})
+    r.raise_for_status()
+    new_key, new_id = r.json()["api_key"], r.json()["key"]["id"]
+    prov = next(p for p in su("GET", "/v1/admin/providers").json()["items"] if p["id"] == provider_id)
+    for k in prov["keys"]:
+        if k["id"] != new_id and not k.get("revoked_at"):
+            su("DELETE", f"/v1/admin/providers/{provider_id}/keys/{k['id']}")
+    remember_key(provider_id, new_key)
+    return new_key
+
+
+def _entity_name(body: Any) -> str:
+    if isinstance(body, dict):
+        return body.get("entity") or body.get("name")
+    m = re.search(r"^(?:entity|name):\s*([A-Za-z0-9_]+)", body, re.M)
+    return m.group(1)
+
+
+def find_config(key: str, name: str) -> Optional[dict]:
+    items = requests.get(f"{BASE}/v1/configs", headers=_headers(key), params={"scope": "mine"}).json()["items"]
+    return next((i for i in items if i["name"] == name), None)
+
+
+def ensure_config(key: str, body: Any, *, params: Optional[dict] = None,
+                  owner_key: Optional[str] = None) -> Tuple[str, bool]:
+    """Publish a config only if its name is free. Returns (config_id, created).
+
+    body: a dict (sent as JSON) or YAML text. Existing configs are NEVER modified or re-seeded
+    (that would be destructive); use PATCH ... ?confirm=true on purpose if you want that.
+    owner_key: whose configs to search when a superuser publishes for someone else (?provider_id=).
+    """
+    name = _entity_name(body)
+    lookup = owner_key or key
+    existing = find_config(lookup, name)
+    if existing:
+        return existing["id"], False
+    kwargs = {"json": body, "headers": JSON} if isinstance(body, dict) else {"data": body, "headers": YAML}
+    r = requests.post(f"{BASE}/v1/configs", headers=_headers(key, kwargs.pop("headers")), params=params, **kwargs)
+    if r.status_code == 409 and r.json().get("error", {}).get("code") == "already_exists":
+        return find_config(lookup, name)["id"], False       # lost a race with another run
+    r.raise_for_status()
+    return r.json()["id"], True
+
+
+def drop_config(key: str, name: str) -> bool:
+    """Delete a config by name if it exists (children must be dropped first). True if deleted."""
+    cfg = find_config(key, name)
+    if not cfg:
+        return False
+    r = requests.delete(f"{BASE}/v1/configs/{cfg['id']}", headers=_headers(key), params={"confirm": "true"})
+    r.raise_for_status()
+    return True
+
+
+def iter_rows(key: str, config_id: str, page: int = 500) -> Iterator[dict]:
+    after = None
+    while True:
+        params = {"limit": page, **({"after": after} if after else {})}
+        body = requests.get(f"{BASE}/v1/configs/{config_id}/data", headers=_headers(key), params=params).json()
+        yield from body["items"]
+        after = body.get("next_after")
+        if not after:
+            return
+
+
+def ensure_row(key: str, config_id: str, match: dict, body: Optional[dict] = None) -> Tuple[dict, bool]:
+    """Create a row only if no live row already has the `match` field values. Returns (row, created).
+
+    Primary keys cannot be chosen by the caller, so a field (or fields) you control is the identity.
+    """
+    for row in iter_rows(key, config_id):
+        if all(row.get(k) == v for k, v in match.items()):
+            return row, False
+    r = requests.post(f"{BASE}/v1/configs/{config_id}/data", headers=_headers(key, JSON), json={**match, **(body or {})})
+    r.raise_for_status()
+    return r.json(), True
+
+
+def baseline_data(key: str, config_id: str, seed: int = 42, count: Optional[int] = None) -> dict:
+    """Converge a config (and its dependents) to the SAME rows every time: replace + fixed seed."""
+    body = {"mode": "replace", "confirm": True, "seed": seed, **({"count": count} if count is not None else {})}
+    r = requests.post(f"{BASE}/v1/configs/{config_id}/batch", headers=_headers(key, JSON), json=body)
+    r.raise_for_status()
+    return r.json()
+
+
+# ------------------------------------------------------------ guide-only extras ----
+# Everything this guide creates, CHILDREN BEFORE PARENTS (a referenced config cannot be deleted).
+GUIDE_CONFIGS = ["starved_child", "empty_parent", "b_child", "b_parent", "acme_tickets", "acme_orders",
+                 "acme_customers", "scratch", "shared_name", "bobs_things", "seed_a", "seed_b", "restart_probe"]
+
+
+def teardown() -> None:
+    """Delete every config the guide created, for both providers. Providers cannot be deleted (no route)."""
+    for key in filter(None, (KEY, KEY2)):
+        for name in GUIDE_CONFIGS:
+            try:
+                if drop_config(key, name):
+                    print("dropped", name)
+            except requests.HTTPError as exc:
+                print("could not drop", name, "-", exc.response.json().get("error"))
 ```
 
 Usage pattern:
@@ -252,6 +373,83 @@ st("GET", "/v1/me", key=KEY)   # prints status only
 | **[SU/P]** | either                                               |
 | **[none]** | no key needed (`/health` only)                       |
 
+#### 0.2 Idempotent run process
+
+**Goal:** run the guide top to bottom, stop half-way and run it again, or run it every morning against the same server and database — and end up in the same state instead of `409 already_exists` errors and ever-growing duplicates.
+
+**The contract**
+
+| Kind of step | What goes wrong on a re-run | How the guide makes it safe |
+| --- | --- | --- |
+| **Providers** | a second provider with the same name (older builds), or `409 already_exists` | `ensure_provider(name)` finds the provider (by the saved id, else by normalised name), reactivates it if needed, and returns a working key |
+| **Provider keys** (secret shown **once**) | the secret can never be read back | the key is saved in `.synthetic_state.json` (mode 600 — **git-ignore it**). Lost or revoked → exactly **one** new key is issued, never a pile |
+| **Configs** | `409 already_exists` on the second publish | `ensure_config(key, body)` publishes only if the name is free and **never edits or re-seeds** an existing config (that is destructive and has its own step, §5.7) |
+| **Rows you choose** | duplicate rows | `ensure_row(key, config_id, {match})` — a caller cannot choose a primary key, so a field you control is the row's identity |
+| **Generated rows** | the table grows on every run | `baseline_data(key, config_id, seed=42)` = `replace` + fixed seed → the same ids and values every time (dependents come along) |
+| **Seeded appends** | `409 duplicate_primary_key` the second time | same seed + same request = same ids, so the 409 *is* the guard — treat it as "already done" |
+| **Switches** (`is_only_me`, `fail_rate`, deactivate, rename, cadence) | a crash leaves the system in the odd state | wrapped in `try/finally`, so the restore always runs |
+| **Destructive steps** (`reset`, `PATCH fields`, `DELETE`) | — | idempotent by nature: they converge to the same end state; deleting something already gone is a `404`, which is fine |
+
+**First cell of every session** (safe to repeat; §4.1 makes the same calls):
+
+```python
+alice = ensure_provider("Alice Almeida")
+KEY, A_ID, A_KEYID = alice["api_key"], alice["id"], alice["key_id"]
+bob = ensure_provider("Bob Bautista")
+KEY2, B_ID = bob["api_key"], bob["id"]
+print("Alice", A_ID, "created" if alice["created"] else "reused", "| Bob", B_ID, "created" if bob["created"] else "reused")
+```
+
+**Start over / clean up**
+
+```python
+teardown()                                # drop every config the guide made (children first)
+STATE_FILE.unlink(missing_ok=True)        # forget saved keys; providers stay, the next run issues one fresh key each
+```
+
+Providers have no delete route, so they can only be deactivated. For a truly pristine start, stop the server, delete `synthetic.db` (and `.synthetic_state.json`), start again.
+
+**Why not just `?on_exists=reuse`?** It returns the existing provider but **no key** (only a hash is kept), and not every build has it. `ensure_provider` works either way: it never relies on the server refusing a duplicate.
+
+---
+
+### Quick start (5 minutes)
+
+The shortest path from nothing to "I created an API key, published a YAML config and read generated data". Paste the [§0 helper block](#0-before-you-start) first; every step below is safe to repeat.
+
+```python
+# 1. Install (run once in a terminal)
+#    python -m venv .venv && source .venv/bin/activate
+#    pip install -r requirements.txt
+#    pip install requests   # for the examples in this guide
+
+# 2. Make (or reuse) the SUPERUSER key and start the server (terminal)
+#    export API_KEY=${API_KEY:-$(python -m app.cli genkey)}   # keeps the key you already have
+#    echo "$API_KEY"                                          # keep it
+#    uvicorn app.main:app --reload
+#    The §0 helper block reads this key from the API_KEY environment variable (SU).
+
+# 3. Find-or-create the PROVIDER and its API key.
+#    The secret is shown ONCE, so ensure_provider() saves it for re-runs.
+provider = ensure_provider("Acme Data Team")
+KEY = provider["api_key"]
+print(json.dumps({**provider, "api_key": KEY[:8] + "…"}, indent=2))
+
+# 4. Publish a config (YAML straight from the configs/ folder) — only if the name is still free
+yaml_body = Path("configs/customers.yaml").read_text()
+CID, created = ensure_config(KEY, yaml_body)
+print("published" if created else "already published - reused", CID)
+
+# 5. Read the generated data and its change feed
+data = pv("GET", f"/v1/configs/{CID}/data", params={"limit": 5}).json()
+print(json.dumps(data, indent=2))
+
+changes = pv("GET", f"/v1/configs/{CID}/changes", params={"since": 0, "limit": 5}).json()
+print(json.dumps(changes, indent=2))
+```
+
+If step 4 printed `published` the config was just created and seeded with 30 rows (the POST response says `"seeded_rows": 30`); on a re-run it prints `already published - reused` and nothing changes. Either way, step 5 should show rows — you are done with the basics. The rest of this document tests everything else.
+
 ---
 
 ## Part 2 — Install, access & identity
@@ -269,7 +467,9 @@ st("GET", "/v1/me", key=KEY)   # prints status only
 import os
 import subprocess
 
-key = subprocess.check_output(["python", "-m", "app.cli", "genkey"], text=True).strip()
+# Reuse the key you already have; only generate one the first time (a new key per run would no longer match
+# the key your running server was started with).
+key = os.environ.get("API_KEY") or subprocess.check_output(["python", "-m", "app.cli", "genkey"], text=True).strip()
 os.environ["API_KEY"] = key
 print("SUPERUSER KEY:", key)
 
@@ -437,36 +637,34 @@ A **provider** is a publisher of configs (an `id` + `full_name`). There is **no 
 #### 4.1 Create a provider and its first key **[SU]**
 
 ```python
-r = su("POST", "/v1/admin/providers", headers=JSON, json={"full_name": "Alice Almeida"})
-r.raise_for_status()
-alice = r.json()
-pp(alice)
-KEY = alice["api_key"]
-A_ID = alice["id"]
-A_KEYID = alice["key"]["id"]
-
-r = su("POST", "/v1/admin/providers", headers=JSON, json={"full_name": "Bob Bautista"})
-r.raise_for_status()
-bob = r.json()
-pp(bob)
-KEY2 = bob["api_key"]
-B_ID = bob["id"]
+alice = ensure_provider("Alice Almeida")
+KEY, A_ID, A_KEYID = alice["api_key"], alice["id"], alice["key_id"]
+bob = ensure_provider("Bob Bautista")
+KEY2, B_ID = bob["api_key"], bob["id"]
+pp({"alice": {**alice, "api_key": KEY[:8] + "…"}, "bob": {**bob, "api_key": KEY2[:8] + "…"}})
+# First run: created=True for both. Re-run: created=False, same ids, nothing new is issued.
 ```
 
-**Expect `201`** with: `id` (`prov_…`), `full_name`, `is_active: true`, `is_system: false`, `created: true`, `api_key` (the secret — **shown exactly once**), `key` (`id`, `key_prefix` = first 8 chars of the secret, `label: "initial"`), and a `note` telling you to store it now.
+**Expect `201`** (first run only — a re-run reuses the provider and shows `created: False`) with: `id` (`prov_…`), `full_name`, `is_active: true`, `is_system: false`, `created: true`, `api_key` (the secret — **shown exactly once**), `key` (`id`, `key_prefix` = first 8 chars of the secret, `label: "initial"`), and a `note` telling you to store it now.
 `full_name` is trimmed and must be 1–100 characters. It is **unique**, compared case- and whitespace-insensitively (`"  Alice  Almeida "` == `"alice almeida"`) — a repeated POST is a retry, not a request for a second provider.
 
 **Duplicate name → `409 already_exists`**, and the message names the `id` already using it:
 
 ```python
-su("POST", "/v1/admin/providers", headers=JSON, json={"full_name": "Alice Almeida"}).status_code  # 409
+r = su("POST", "/v1/admin/providers", headers=JSON, json={"full_name": "Alice Almeida"})
+print(r.status_code)   # 409
+if r.status_code == 201:   # an older build without unique names just made a duplicate - park it
+    su("PATCH", f"/v1/admin/providers/{r.json()['id']}", headers=JSON, json={"is_active": False})
 ```
 
 **Idempotent retries — `?on_exists=reuse`:** returns the existing provider with **`200`**, `created: false`, and `api_key`/`key` both `null`. Nothing is created and **no new key is issued** (only the original's hash is kept, so it cannot be re-shown); the `note` points at `POST /v1/admin/providers/{id}/keys` if you need a new one. A name that is still free is created normally (`201`, `created: true`).
 
 ```python
 r = su("POST", "/v1/admin/providers?on_exists=reuse", headers=JSON, json={"full_name": "Alice Almeida"})
-print(r.status_code, r.json()["created"], r.json()["api_key"])   # 200 False None
+body = r.json()
+print(r.status_code, body.get("created"), body.get("api_key"))   # 200 False None
+if r.status_code == 201:   # a build without ?on_exists ignored it and created a duplicate - park it
+    su("PATCH", f"/v1/admin/providers/{body['id']}", headers=JSON, json={"is_active": False})
 ```
 
 > There is no route to delete a provider, so a duplicate could only ever be *deactivated* — refusing to create it is the fix, not a cleanup.
@@ -518,14 +716,17 @@ Before first use `last_used_at` is `null`. Call `pv("GET", "/v1/me")`, then list
 #### 4.6 Rename, deactivate, reactivate **[SU]**
 
 ```python
-pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"full_name": "Alice A."}).json())
-pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"is_active": False}).json())
-st("GET", "/v1/me", key=KEY)   # 401 — keys of an inactive provider are locked out
-pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"is_active": True}).json())
-st("GET", "/v1/me", key=KEY)   # 200 — restored
+try:
+    pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"full_name": "Alice A."}).json())
+    pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"is_active": False}).json())
+    st("GET", "/v1/me", key=KEY)   # 401 — keys of an inactive provider are locked out
+    pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"is_active": True}).json())
+    st("GET", "/v1/me", key=KEY)   # 200 — restored
 
-# renaming onto a name another provider holds -> 409 already_exists
-pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"full_name": "Bob Bautista"}).json())
+    # renaming onto a name another provider holds -> 409 already_exists
+    pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"full_name": "Bob Bautista"}).json())
+finally:   # always leave Alice named "Alice Almeida" and active, so a re-run (or a crash) starts clean
+    su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"full_name": "Alice Almeida", "is_active": True})
 ```
 
 > A deactivated provider's **public configs stay readable and keep updating** — deactivation only locks its keys out.
@@ -533,18 +734,24 @@ pp(su("PATCH", f"/v1/admin/providers/{A_ID}", headers=JSON, json={"full_name": "
 #### 4.7 Issue a second key and rotate **[SU]**
 
 ```python
+OLD_KEY = KEY
 r = su("POST", f"/v1/admin/providers/{A_ID}/keys", headers=JSON, json={"label": "ci"})
 r.raise_for_status()
 newkey = r.json()
 pp(newkey)
 KEY_NEW = newkey["api_key"]
 st("GET", "/v1/me", key=KEY_NEW)   # 200 — both keys work now
+st("GET", "/v1/me", key=OLD_KEY)   # 200 — the old one works until it is revoked
 
-# revoke the old one
-pp(su("DELETE", f"/v1/admin/providers/{A_ID}/keys/{A_KEYID}").json())
-st("GET", "/v1/me", key=KEY)       # 401 — old key is dead
+# revoke every OTHER active key (the old one) -> exactly one active key is left, however often you run this
+alice_keys = next(p for p in su("GET", "/v1/admin/providers").json()["items"] if p["id"] == A_ID)["keys"]
+for k in alice_keys:
+    if k["id"] != newkey["key"]["id"] and not k["revoked_at"]:
+        pp(su("DELETE", f"/v1/admin/providers/{A_ID}/keys/{k['id']}").json())
+st("GET", "/v1/me", key=OLD_KEY)   # 401 — old key is dead
 st("GET", "/v1/me", key=KEY_NEW)   # 200 — new key keeps working
-KEY = KEY_NEW                      # carry on with the new key
+KEY, A_KEYID = KEY_NEW, newkey["key"]["id"]   # carry on with the new key...
+remember_key(A_ID, KEY)                        # ...and save it, so the next run reuses it instead of issuing another
 ```
 
 The body is optional (`POST …/keys` with no body works; `label` ≤ 100 chars → otherwise `422 invalid_label`). Revoking twice is harmless.
@@ -791,17 +998,17 @@ Publish them **parents first** — a `ref` must already name a config of yours, 
 ```python
 published = {}
 for cfg in (ACME_CUSTOMERS, ACME_ORDERS, ACME_TICKETS):
-    r = pv("POST", "/v1/configs", headers=JSON, json=cfg)
-    r.raise_for_status()
-    body = r.json()
-    published[body["name"]] = body["id"]
-    print(body["name"], body["id"], "source:", body["source"], "seeded_rows:", body["seeded_rows"])
+    config_id, created = ensure_config(KEY, cfg)      # publishes only if the name is still free
+    published[cfg["entity"]] = config_id
+    info = pv("GET", f"/v1/configs/{config_id}").json()
+    print(cfg["entity"], config_id, "source:", info["source"], "|", "created now" if created else "already there - reused")
 
 CID = published["acme_customers"]
 OID = published["acme_orders"]
 TID = published["acme_tickets"]
-# Expect 201 each; source "api"; seeded_rows 25 / 40 / 15; response["config"]["fields"] also
+# First run: 201 each; source "api"; seeded_rows 25 / 40 / 15 (in the POST response); the stored config also
 # holds a `version` int field you never sent — it is added for you.
+# Re-run: nothing is created, re-seeded or changed.
 ```
 
 `requests` sets `Content-Type: application/json` on its own when you pass `json=`, so `headers=JSON` is belt-and-braces. To go through a file instead, serialise and post the bytes:
@@ -811,11 +1018,12 @@ Path("acme_customers.json").write_text(json.dumps(ACME_CUSTOMERS, indent=2))
 
 # a) honest JSON
 r = pv("POST", "/v1/configs", headers=JSON, data=Path("acme_customers.json").read_text())
-print(r.status_code)                       # 201
+print(r.status_code)                       # 201 on a pristine database; 409 if the loop above already published it
+assert r.status_code in (201, 409)
 
 # b) the same JSON mislabelled as YAML — still fine, YAML is a superset of JSON
 r = pv("POST", "/v1/configs", headers=YAML, data=Path("acme_customers.json").read_text())
-print(r.status_code)                       # 409 already_exists (posted in step a)
+print(r.status_code)                       # 409 already_exists (posted in step a, or by the loop above)
 ```
 
 Notes and traps specific to this route:
@@ -845,30 +1053,25 @@ pp(r.json())
 #### 5.5 Publish **[SU/P]**
 
 ```python
-# parents first
-r = pv("POST", "/v1/configs", headers=YAML, data=Path("acme_customers.yaml").read_text())
-r.raise_for_status()
-c = r.json()
+# parents first; each one is published only if its name is still free (re-run safe)
+CID, created = ensure_config(KEY, Path("acme_customers.yaml").read_text())
+c = pv("GET", f"/v1/configs/{CID}").json()
 pp({k: c[k] for k in ("id", "name", "owner", "is_only_me", "source", "can_write", "cadence", "seeded_rows") if k in c})
-CID = c["id"]
+print("customers:", "created" if created else "reused")
 
-r = pv("POST", "/v1/configs", headers=YAML, data=Path("acme_orders.yaml").read_text())
-r.raise_for_status()
-OID = r.json()["id"]
-print("orders seeded_rows:", r.json()["seeded_rows"])
+OID, created = ensure_config(KEY, Path("acme_orders.yaml").read_text())
+print("orders:", "created" if created else "reused")
 
-r = pv("POST", "/v1/configs", headers=YAML, data=Path("acme_tickets.yaml").read_text())
-r.raise_for_status()
-TID = r.json()["id"]
-print("tickets seeded_rows:", r.json()["seeded_rows"])
+TID, created = ensure_config(KEY, Path("acme_tickets.yaml").read_text())
+print("tickets:", "created" if created else "reused")
 ```
 
-**Expect `201`** each: `id` (`cfg_<16 hex>`), `name`, `owner{id,full_name}`, `is_only_me`, `source: "api"`, `can_write: true`, `cadence`, `fields[]`, `created_at`, `updated_at`, `config{…}`, and `seeded_rows` (25 / 40 / 15).
+**Expect `201`** each on the first run (a re-run reuses the config and prints `reused`): `id` (`cfg_<16 hex>`), `name`, `owner{id,full_name}`, `is_only_me`, `source: "api"`, `can_write: true`, `cadence`, `fields[]`, `created_at`, `updated_at`, `config{…}`, and `seeded_rows` (25 / 40 / 15).
 
 Same thing as JSON:
 
 ```python
-r = pv("POST", "/v1/configs", headers=JSON, json={
+SID, created = ensure_config(KEY, {
     "entity": "scratch",
     "fields": {
         "id": {"type": "uuid", "primary_key": True},
@@ -876,9 +1079,7 @@ r = pv("POST", "/v1/configs", headers=JSON, json={
     },
     "seed": {"initial_count": 6},
 })
-r.raise_for_status()
-SID = r.json()["id"]
-print("scratch seeded_rows:", r.json()["seeded_rows"])
+print("scratch:", "created (6 seeded rows)" if created else "reused")
 ```
 
 Check the table namespacing (SQLite): internal tables look like `d_<10 hex>_acme_customers`. **You never see those names in API responses, DDL, exports or error messages.**
@@ -992,7 +1193,7 @@ pp(r.json())   # {"deleted": true, "id": "cfg_…", "name": "scratch"}
 st("GET", f"/v1/configs/{SID}", key=KEY)   # 404
 ```
 
-Deleting drops the table **and** its change history, unschedules its job, and frees a quota slot and the name. Built-in configs: `409 managed_by_yaml`.
+Deleting drops the table **and** its change history, unschedules its job, and frees a quota slot and the name. Built-in configs: `409 managed_by_yaml`. Running the snippet again without re-running §5.5 first gives `404 not_found` — it is already gone, which is the same end state.
 
 #### 5.9 Dependencies (parents, children, cycles)
 
@@ -1005,26 +1206,35 @@ r = pv("POST", "/v1/configs/validate", headers=YAML, data=lonely)
 print(r.json()["error"]["message"])   # "…not one of your configs…"
 
 # 2. a parent with ZERO rows can't seed a child
-ep = pv("POST", "/v1/configs", headers=JSON, json={
+for leftover in ("starved_child", "empty_parent"):   # start clean (child first) — leftovers from an earlier run
+    drop_config(KEY, leftover)
+
+EP, _ = ensure_config(KEY, {
     "entity": "empty_parent",
     "fields": {"id": {"type": "uuid", "primary_key": True}},
     "seed": {"initial_count": 0},
-}).json()
-r = pv("POST", "/v1/configs", headers=JSON, json={
+})
+STARVED_CHILD = {
     "entity": "starved_child",
     "fields": {
         "id": {"type": "uuid", "primary_key": True},
         "p": {"type": "ref", "ref_entity": "empty_parent"},
     },
     "seed": {"initial_count": 3},
-})
+}
+r = pv("POST", "/v1/configs", headers=JSON, json=STARVED_CHILD)
 print(r.status_code, r.json().get("error"))   # 409 missing_parent_rows
 
 # give the parent rows, then the same child POST succeeds
-pv("POST", f"/v1/configs/{ep['id']}/batch", headers=JSON, json={"count": 3})
-# ...now publish starved_child. Clean up later with DELETE ?confirm=true (child first).
+pv("POST", f"/v1/configs/{EP}/batch", headers=JSON, json={"count": 3})
+child_id, created = ensure_config(KEY, STARVED_CHILD)
+print("starved_child:", "published now that the parent has rows" if created else "reused")
+# ...clean up (child first) so the next run starts from the same state:
+for leftover in ("starved_child", "empty_parent"):
+    drop_config(KEY, leftover)
 
 # 3. a parent that is referenced can't be deleted or have its fields changed
+assert find_config(KEY, "acme_orders"), "publish the acme chain first (§5.5) - otherwise this step would really delete acme_customers"
 r = pv("DELETE", f"/v1/configs/{CID}", params={"confirm": "true"})
 print(r.status_code, r.json().get("error"))   # 409 has_dependents (lists acme_orders)
 # delete children first: tickets -> orders -> customers
@@ -1102,6 +1312,7 @@ Use a **fresh database**:
 
 ```python
 # Terminal:
+#   rm -f quota_test.db            # an empty database every time keeps this section re-runnable
 #   DATABASE_URL=sqlite:///./quota_test.db \
 #   MAX_CONFIGS_PER_PROVIDER=2 MAX_FIELDS_PER_CONFIG=9 MAX_INITIAL_COUNT=20 \
 #   MAX_LATENCY_MS=50 MAX_ROWS_PER_CONFIG=30 \
@@ -1123,13 +1334,14 @@ Use a **fresh database**:
 #### 5.12 Superuser publishing for someone else
 
 ```python
-r = su("POST", "/v1/configs", params={"provider_id": B_ID}, headers=JSON, json={
+BT_ID, created = ensure_config(SU, {
     "entity": "bobs_things",
     "fields": {"id": {"type": "uuid", "primary_key": True}, "label": {"type": "string"}},
     "seed": {"initial_count": 4},
-})
-pp({"id": r.json()["id"], "owner": r.json()["owner"]})
-print([i["name"] for i in pv2("GET", "/v1/configs", params={"scope": "mine"}).json()["items"]])
+}, params={"provider_id": B_ID}, owner_key=KEY2)      # owner_key: look for it among BOB's configs
+mine = pv2("GET", "/v1/configs", params={"scope": "mine"}).json()["items"]
+pp({"id": BT_ID, "created": created, "owner": next(i for i in mine if i["id"] == BT_ID)["owner"]})
+print([i["name"] for i in mine])
 
 r = pv("POST", "/v1/configs", params={"provider_id": B_ID}, headers=JSON, json={})
 print(r.status_code, r.json().get("error"))   # Alice -> 403
@@ -1146,26 +1358,29 @@ print(r.status_code, r.json().get("error"))   # 404
 
 Rows live under `/v1/configs/{config_id}/data`. **Reads:** owner, superuser, or anyone if the config is public. **Writes:** owner or superuser only. Examples use `$OID` (`acme_orders`).
 
+**Start from a known state (re-run safe).** Generated rows get random ids, so the tables would grow on every run. This puts all three acme tables back to the *same* seeded rows (25 / 40 / 15) first — dependents come along:
+
+```python
+baseline_data(KEY, CID, seed=42)   # replace + fixed seed; orders and tickets are refreshed too (auto_included)
+```
+
 #### 6.1 Create **[P/SU]**
 
 ```python
-# a) completely generated row (empty body)
+# a) completely generated row (empty body) — (append-only) one more random row per run; baseline_data() resets
 r = pv("POST", f"/v1/configs/{OID}/data", headers=JSON, json={})
 pp(r.json())
 
-# b) you set some fields, the rest are generated
-r = pv("POST", f"/v1/configs/{OID}/data", headers=JSON, json={
-    "amount": 99.5, "status": "pending", "note": "hello",
-})
-r.raise_for_status()
-row = r.json()
+# b) you set some fields, the rest are generated — created only if no live row with this note exists yet
+row, created = ensure_row(KEY, OID, {"note": "hello"}, {"amount": 99.5, "status": "pending"})
 RID = row["order_id"]
+print("created" if created else "reused")
 pp(row)
 
 # c) pin the relationship to a real parent
 cust = pv("GET", f"/v1/configs/{CID}/data", params={"limit": 1}).json()["items"][0]["customer_id"]
-r = pv("POST", f"/v1/configs/{OID}/data", headers=JSON, json={"customer_id": cust, "amount": 10})
-pp({"order_id": r.json()["order_id"], "customer_id": r.json()["customer_id"], "amount": r.json()["amount"]})
+row, created = ensure_row(KEY, OID, {"customer_id": cust, "amount": 10})
+pp({"order_id": row["order_id"], "customer_id": row["customer_id"], "amount": row["amount"], "created": created})
 ```
 
 **Expect `201`** and the full row: generated `order_id`, `version` (next table-wide number), `created_at`/`updated_at` set, `deleted_at: null`.
@@ -1226,6 +1441,8 @@ def try_write(label: str, payload: dict) -> None:
     r = pv("POST", f"/v1/configs/{OID}/data", headers=JSON, json=payload)
     code = r.json().get("error", {}).get("code", f"status={r.status_code}")
     print(f"{label:30} {code}")
+    if r.status_code == 201:   # the two "(ok)" cases create a row — soft-delete it so re-runs leave the live data unchanged
+        pv("DELETE", f"/v1/configs/{OID}/data/{r.json()['order_id']}")
 
 try_write("unknown field",          {"bogus": 1})
 try_write("set primary key",        {"order_id": "mine"})
@@ -1254,6 +1471,8 @@ r = pv2("POST", f"/v1/configs/{OID}/data", headers=JSON, json={})
 print(r.status_code, r.json().get("error"))   # 403 forbidden
 r = su("POST", f"/v1/configs/{OID}/data", headers=JSON, json={})
 print(r.json().get("order_id"))               # superuser CAN write
+if r.ok:                                      # soft-delete the probe row so re-runs leave the live data unchanged
+    su("DELETE", f"/v1/configs/{OID}/data/{r.json()['order_id']}")
 ```
 
 ---
@@ -1331,13 +1550,25 @@ pp(r.json().get("error"))
 ```python
 r = pv("POST", f"/v1/configs/{OID}/batch", headers=JSON, json={"count": 5, "seed": 123})
 pp(r.json())
-# entities[0].inserted == 5
+# entities[0].inserted == 5 on the first run. The SAME seed again produces the same ids -> 409 duplicate_primary_key:
+# that is the idempotency guard, not a failure.
+assert r.status_code in (200, 409)
 ```
 
 #### 8.2 Same seed ⇒ identical data
 
 ```python
 # publish two empty configs, batch both with seed=42 → identical names
+SEEDED = {
+    "fields": {"id": {"type": "uuid", "primary_key": True}, "label": {"type": "string", "key_label": "full_name"}},
+    "seed": {"initial_count": 0},
+}
+SEED_A, _ = ensure_config(KEY, {"entity": "seed_a", **SEEDED})
+SEED_B, _ = ensure_config(KEY, {"entity": "seed_b", **SEEDED})
+for cid in (SEED_A, SEED_B):
+    baseline_data(KEY, cid, seed=42, count=5)      # replace + the same seed: the same 5 rows on every run
+labels = [[r["label"] for r in iter_rows(KEY, cid)] for cid in (SEED_A, SEED_B)]
+print(labels[0] == labels[1], labels[0][:2])       # True — identical names
 ```
 
 Reusing a seed on a live table that already has matching PKs → `409 duplicate_primary_key`.
@@ -1349,7 +1580,7 @@ r = pv("POST", f"/v1/configs/{CID}/batch", headers=JSON, json={"mode": "replace"
 print(r.status_code, r.json().get("error"))   # 400 confirmation_required
 
 r = pv("POST", f"/v1/configs/{CID}/batch", headers=JSON, json={
-    "mode": "replace", "confirm": True, "count": 3,
+    "mode": "replace", "confirm": True, "count": 3, "seed": 42,
 })
 pp(r.json())
 # auto_included includes child config names; total_rows reflect new counts
@@ -1359,7 +1590,7 @@ pp(r.json())
 
 ```python
 r = pv("POST", f"/v1/configs/{OID}/batch", headers=JSON, json={
-    "mode": "reset", "confirm": True, "count": 2,
+    "mode": "reset", "confirm": True, "count": 2, "seed": 42,
 })
 feed = pv("GET", f"/v1/configs/{OID}/changes", params={"since": 0}).json()["changes"]
 print(len(feed), min(c["version"] for c in feed))   # 2, 1
@@ -1409,30 +1640,33 @@ To force a tick without waiting: use `simulate` with an empty body, or the inter
 ### 11. Failure injection
 
 ```python
-# hard-fail every row read
-pv("PATCH", f"/v1/configs/{CID}", headers=JSON, json={"failure_injection": {"fail_rate": 1.0}})
-r = pv("GET", f"/v1/configs/{CID}/data", params={"limit": 1})
-print(r.status_code, r.json().get("error"))   # 500 injected_failure
+try:
+    # hard-fail every row read
+    pv("PATCH", f"/v1/configs/{CID}", headers=JSON, json={"failure_injection": {"fail_rate": 1.0}})
+    r = pv("GET", f"/v1/configs/{CID}/data", params={"limit": 1})
+    print(r.status_code, r.json().get("error"))   # 500 injected_failure
 
-# change feed & export are unaffected
-print(pv("GET", f"/v1/configs/{CID}/changes", params={"since": 0, "limit": 1}).status_code)  # 200
-
-# recover
-pv("PATCH", f"/v1/configs/{CID}", headers=JSON, json={"failure_injection": {"fail_rate": 0.0}})
+    # change feed & export are unaffected
+    print(pv("GET", f"/v1/configs/{CID}/changes", params={"since": 0, "limit": 1}).status_code)  # 200
+finally:
+    # recover — always runs, so an interrupted run never leaves the config failing
+    pv("PATCH", f"/v1/configs/{CID}", headers=JSON, json={"failure_injection": {"fail_rate": 0.0}})
 print(pv("GET", f"/v1/configs/{CID}/data", params={"limit": 1}).status_code)  # 200
 ```
 
 Probabilistic:
 
 ```python
-pv("PATCH", f"/v1/configs/{CID}", headers=JSON, json={"failure_injection": {"fail_rate": 0.3}})
 from collections import Counter
-codes = Counter(
-    requests.get(f"{BASE}/v1/configs/{CID}/data", headers=_headers(KEY), params={"limit": 1}).status_code
-    for _ in range(100)
-)
-print(codes)   # ~70 × 200, ~30 × 500
-pv("PATCH", f"/v1/configs/{CID}", headers=JSON, json={"failure_injection": {"fail_rate": 0.0}})
+try:
+    pv("PATCH", f"/v1/configs/{CID}", headers=JSON, json={"failure_injection": {"fail_rate": 0.3}})
+    codes = Counter(
+        requests.get(f"{BASE}/v1/configs/{CID}/data", headers=_headers(KEY), params={"limit": 1}).status_code
+        for _ in range(100)
+    )
+    print(codes)   # ~70 × 200, ~30 × 500
+finally:
+    pv("PATCH", f"/v1/configs/{CID}", headers=JSON, json={"failure_injection": {"fail_rate": 0.0}})
 ```
 
 Built-in `support_tickets` ships with `fail_rate: 0.02` — occasional 500s on legacy `/support_tickets` are expected.
@@ -1574,7 +1808,9 @@ for i in shared:
 
 print(pv2("GET", f"/v1/configs/{OID}/data", params={"limit": 1}).status_code)  # 200
 
-def sweep(key: str, config_id: str) -> None:
+def sweep(key: str, config_id: str, read_only: bool = False) -> None:
+    """read_only=True sends only the GETs — use it for the SUPERUSER, whose writes would really succeed
+    (a POST /batch would add rows and a DELETE ?confirm=true could drop the config)."""
     specs = [
         ("GET", f"/v1/configs/{config_id}"),
         ("GET", f"/v1/configs/{config_id}/data"),
@@ -1592,6 +1828,8 @@ def sweep(key: str, config_id: str) -> None:
         ("POST", f"/v1/configs/{config_id}/batch"),
         ("POST", f"/v1/configs/{config_id}/simulate"),
     ]
+    if read_only:
+        specs = [s for s in specs if s[0] == "GET"]
     for method, path in specs:
         path_only, _, qs = path.partition("?")
         params = dict(p.split("=") for p in qs.split("&") if p) if qs else None
@@ -1610,23 +1848,25 @@ sweep(KEY2, OID)
 #### 15.2 Private config: invisible to everyone but owner and superuser
 
 ```python
-pv("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"is_only_me": True})
-sweep(KEY2, OID)   # EVERY line -> 404
-print(any(i["name"] == "acme_orders" for i in pv2("GET", "/v1/configs", params={"scope": "all"}).json()["items"]))  # False
-sweep(SU, OID)     # superuser still sees it
-pv("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"is_only_me": False})
+try:
+    pv("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"is_only_me": True})
+    sweep(KEY2, OID)   # EVERY line -> 404
+    print(any(i["name"] == "acme_orders" for i in pv2("GET", "/v1/configs", params={"scope": "all"}).json()["items"]))  # False
+    sweep(SU, OID, read_only=True)     # superuser still sees it (GETs only — see sweep's docstring)
+finally:
+    pv("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"is_only_me": False})
 ```
 
 #### 15.3 Tenants never meet
 
 ```python
 # same name, two providers, separate data — allowed
-pv("POST", "/v1/configs", headers=JSON, json={
+ensure_config(KEY, {
     "entity": "shared_name",
     "fields": {"id": {"type": "uuid", "primary_key": True}},
     "seed": {"initial_count": 3},
 })
-pv2("POST", "/v1/configs", headers=JSON, json={
+ensure_config(KEY2, {
     "entity": "shared_name",
     "fields": {"id": {"type": "uuid", "primary_key": True}},
     "seed": {"initial_count": 9},
@@ -1637,19 +1877,19 @@ r = pv2("POST", "/v1/configs/validate", headers=YAML, data=ACME_ORDERS_YAML)
 print(r.json()["error"]["message"])
 
 # a ROW can't point at another provider's parent
-pv2("POST", "/v1/configs", headers=JSON, json={
+ensure_config(KEY2, {
     "entity": "b_parent",
     "fields": {"id": {"type": "uuid", "primary_key": True}},
     "seed": {"initial_count": 2},
 })
-bc = pv2("POST", "/v1/configs", headers=JSON, json={
+bc, _ = ensure_config(KEY2, {
     "entity": "b_child",
     "fields": {
         "id": {"type": "uuid", "primary_key": True},
         "parent": {"type": "ref", "ref_entity": "b_parent"},
     },
     "seed": {"initial_count": 2},
-}).json()["id"]
+})
 alice_cust = pv("GET", f"/v1/configs/{CID}/data", params={"limit": 1}).json()["items"][0]["customer_id"]
 r = pv2("POST", f"/v1/configs/{bc}/data", headers=JSON, json={"parent": alice_cust})
 print(r.status_code, r.json().get("error", {}).get("code"))   # invalid_reference
@@ -1673,25 +1913,32 @@ for i in pv("GET", "/v1/configs", params={"scope": "shared"}).json()["items"]:
 
 print(pv("GET", "/v1/configs/cfg_sys_orders/data", params={"limit": 3}).status_code)  # 200
 print(pv("POST", "/v1/configs/cfg_sys_orders/data", headers=JSON, json={}).status_code)  # 403
-print(su("POST", "/v1/configs/cfg_sys_orders/data", headers=JSON, json={}).status_code)  # 201
+r = su("POST", "/v1/configs/cfg_sys_orders/data", headers=JSON, json={})
+print(r.status_code)  # 201
+if r.ok:   # soft-delete the probe row so re-runs leave the built-in table unchanged
+    su("DELETE", f"/v1/configs/cfg_sys_orders/data/{r.json()['order_id']}")
 ```
 
 #### 15.5 Superuser powers over provider data
 
 ```python
 print(len(su("GET", "/v1/configs", params={"scope": "all"}).json()["items"]))
-su("POST", f"/v1/configs/{OID}/simulate", headers=JSON, json={"inserts": 1})
-su("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"update_schedule": {"cadence": "weekly"}})
-pv("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"update_schedule": {"cadence": "hourly"}})  # restore
+su("POST", f"/v1/configs/{OID}/simulate", headers=JSON, json={"updates": 1})   # updates, not inserts: re-runs don't grow the table
+try:
+    su("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"update_schedule": {"cadence": "weekly"}})
+finally:
+    pv("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"update_schedule": {"cadence": "hourly"}})  # restore
 ```
 
 #### 15.6 Deactivated provider
 
 ```python
-su("PATCH", f"/v1/admin/providers/{B_ID}", headers=JSON, json={"is_active": False})
-st("GET", "/v1/me", key=KEY2)   # 401
-# Bob's PUBLIC configs are still listed/readable and keep updating
-su("PATCH", f"/v1/admin/providers/{B_ID}", headers=JSON, json={"is_active": True})
+try:
+    su("PATCH", f"/v1/admin/providers/{B_ID}", headers=JSON, json={"is_active": False})
+    st("GET", "/v1/me", key=KEY2)   # 401
+    # Bob's PUBLIC configs are still listed/readable and keep updating
+finally:
+    su("PATCH", f"/v1/admin/providers/{B_ID}", headers=JSON, json={"is_active": True})
 ```
 
 ---
@@ -1770,7 +2017,7 @@ st("GET", "/health")  # 200
 
 ---
 
-## Part 7 — Tooling & operations
+## Part 7 — Tooling, operations & reference
 
 ### 17. CLI (no server needed)
 
@@ -1782,8 +2029,19 @@ import subprocess
 def cli(*args: str) -> str:
     return subprocess.check_output(["python", "-m", "app.cli", *args], text=True)
 
-print(cli("genkey"))
-print(cli("create-provider", "--full-name", "Acme Data Team"))
+print(cli("genkey"))   # prints a NEW key on every call — nothing is stored until you export it as API_KEY
+
+
+def cli_create_provider(name: str) -> str:
+    """Create the provider only if no provider already has that name (builds that have `--on-exists reuse` can use it instead)."""
+    try:
+        taken = {_norm(p["full_name"]) for p in su("GET", "/v1/admin/providers").json()["items"]}
+    except requests.RequestException:    # no server running: the CLI talks to the database directly
+        taken = set()
+    return "already exists - skipped" if _norm(name) in taken else cli("create-provider", "--full-name", name)
+
+
+print(cli_create_provider("Acme Data Team"))   # the key it prints is shown ONCE — save it
 
 cli("ddl", "--dialect", "postgresql", "--out", "schema.sql")
 cli("batch", "--counts", "customers=100", "orders=500", "--seed", "1")
@@ -1805,6 +2063,37 @@ Checks:
 
 ---
 
+### 18. Error reference
+
+Every failure uses one envelope: `{"error":{"code":"…","message":"…"}}` (a validation error's `message` is a list).
+
+| Code                                                                                               |      HTTP       | When                                                                                                                                                 |
+| -------------------------------------------------------------------------------------------------- | :-------------: | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unauthorized`                                                                                     |       401       | missing / wrong / revoked key, inactive provider (adds `WWW-Authenticate: ApiKey`)                                                                   |
+| `forbidden`                                                                                        |       403       | provider key on a superuser/legacy route · write to someone else's config · creating a config for another provider                                   |
+| `not_found`                                                                                        |       404       | unknown **or private** config · row missing or soft-deleted · unknown provider/key · unknown entity on `/scheduler/runs`                             |
+| `validation_error`                                                                                 |       422       | bad query/body shape (e.g. `limit=0`, `mode=bogus`, `format=xml`, missing `entity`)                                                                  |
+| `invalid_config`                                                                                   |       422       | a config (or body) failed validation — the message says exactly why                                                                                  |
+| `invalid_request`                                                                                  |       422       | bad `PATCH` body · empty `configs` in a bundle                                                                                                       |
+| `invalid_provider` / `invalid_label`                                                               |       422       | bad `full_name` / key label                                                                                                                          |
+| `payload_too_large`                                                                                |       413       | config body over `MAX_CONFIG_BYTES`                                                                                                                  |
+| `already_exists`                                                                                   |       409       | config name already used by this owner · provider `full_name` already taken (create or rename)                              |
+| `quota_exceeded`                                                                                   |    409 / 422    | too many configs (**409**) · too many rows (**422**)                                                                                                 |
+| `managed_by_yaml`                                                                                  |       409       | edit/delete of a built-in config                                                                                                                     |
+| `has_dependents`                                                                                   |       409       | change fields of / delete a config others reference                                                                                                  |
+| `confirmation_required`                                                                            |       400       | delete config · change fields · `replace`/`reset` without confirm                                                                                    |
+| `missing_parent_rows`                                                                              |       409       | a child has no parent rows to point at                                                                                                               |
+| `busy`                                                                                             |       409       | another bulk write held the lock > 30 s                                                                                                              |
+| `not_supported`                                                                                    | 400 / 409 / 422 | row delete on a config with no soft-delete field (400) · modifying the system provider (409) · `deletes` in simulate with no soft-delete field (422) |
+| `unknown_field` · `read_only_field` · `invalid_value` · `invalid_reference`                        |       422       | row write validation (`/v1`)                                                                                                                         |
+| `cursor_ahead_of_source`                                                                           |       409       | `since` is beyond the latest version (usually after `reset`)                                                                                         |
+| `duplicate_primary_key`                                                                            |       409       | a seeded insert generated a key that already exists — use a different seed                                                                           |
+| `unsupported_format` · `invalid_since` · `since_not_targeted` · `mixed_owners`                     |       422       | export request problems                                                                                                                              |
+| `unknown_entity` · `counts_not_targeted` · `invalid_mode` · `invalid_batch_size` · `invalid_count` |       422       | legacy `/admin/*` & CLI request problems                                                                                                             |
+| `injected_failure`                                                                                 |       500       | failure injection fired                                                                                                                              |
+
+---
+
 ### 19. Restart, Postgres, Docker, pytest
 
 #### 19.1 Startup failure modes
@@ -1822,6 +2111,24 @@ Checks:
 2. Stop the server, start it again (same `DATABASE_URL`, same superuser key).
 3. Verify: `st("GET", "/v1/me", key=KEY)` → `200` · rows intact · superuser still reads the private config · unknown key still → `401` · writes still work.
 4. Providers, hashed keys, configs and data persist. The config's scheduler job is re-registered.
+
+Step 1 as code (re-run safe — the key lives in the state file, so it is still there after the restart):
+
+```python
+rita = ensure_provider("Restart Test")
+RKEY = rita["api_key"]
+RCID, created = ensure_config(RKEY, {
+    "entity": "restart_probe",
+    "is_only_me": True,
+    "fields": {"id": {"type": "uuid", "primary_key": True}, "label": {"type": "string"}},
+    "seed": {"initial_count": 5},
+})
+print(RKEY[:8] + "…", RCID, "created" if created else "reused")
+
+# after the restart (step 3):
+st("GET", "/v1/me", key=RKEY)                                                                          # 200
+print(len(requests.get(f"{BASE}/v1/configs/{RCID}/data", headers=_headers(RKEY)).json()["items"]))   # 5 rows intact
+```
 
 #### 19.3 PostgreSQL
 
@@ -1857,7 +2164,7 @@ Checks:
 
 ### 20. One-shot smoke-test script
 
-Save as `smoke_test.py`, then run: `SU=<superuser key> python smoke_test.py`. Requires `requests` and a server **with a superuser key set**. It creates two providers (providers can't be deleted — the script deactivates them at the end) and cleans up its own configs.
+Save as `smoke_test.py`, then run: `SU=<superuser key> python smoke_test.py`. Requires `requests` and a server **with a superuser key set**. It is re-runnable: the providers `Smoke Alice` / `Smoke Bob` are found and reused (reactivated, one fresh key each — providers can't be deleted), configs left over from an interrupted run are dropped first, and at the end it deletes its own configs, revokes every key it issued and deactivates both providers.
 
 ```python
 #!/usr/bin/env python3
@@ -1894,6 +2201,30 @@ def check(what: str, want: int, method: str, path: str, **kwargs) -> None:
         FAIL = 1
 
 
+def norm(s: str) -> str:
+    return " ".join(s.split()).casefold()
+
+
+def ensure_provider(full_name: str) -> dict:
+    """Find-or-create by name, reactivate, and return a WORKING key (a provider that already exists gets a fresh one)."""
+    items = requests.get(f"{BASE}/v1/admin/providers", headers=SUH).json()["items"]
+    p = next((x for x in items if norm(x["full_name"]) == norm(full_name)), None)
+    if p is None:
+        body = requests.post(f"{BASE}/v1/admin/providers", headers={**SUH, **JSON}, json={"full_name": full_name}).json()
+        return {"id": body["id"], "api_key": body["api_key"], "key_id": body["key"]["id"]}
+    requests.patch(f"{BASE}/v1/admin/providers/{p['id']}", headers={**SUH, **JSON}, json={"is_active": True})
+    k = requests.post(f"{BASE}/v1/admin/providers/{p['id']}/keys", headers={**SUH, **JSON}, json={"label": "smoke"}).json()
+    return {"id": p["id"], "api_key": k["api_key"], "key_id": k["key"]["id"]}
+
+
+def drop_config(key: str, name: str) -> None:
+    """Delete one of this provider's configs by name, if it exists."""
+    items = requests.get(f"{BASE}/v1/configs", headers={"X-API-Key": key}, params={"scope": "mine"}).json()["items"]
+    for i in items:
+        if i["name"] == name:
+            requests.delete(f"{BASE}/v1/configs/{i['id']}", headers={"X-API-Key": key}, params={"confirm": "true"})
+
+
 print("== auth ==")
 check("health is public", 200, "GET", "/health")
 check("no key -> 401", 401, "GET", "/v1/me")
@@ -1902,9 +2233,9 @@ check("key in query string -> 401", 401, "GET", f"/v1/me?api_key={SU}")
 check("superuser /v1/me", 200, "GET", "/v1/me", headers=SUH)
 
 print("== providers ==")
-A = requests.post(f"{BASE}/v1/admin/providers", headers={**SUH, **JSON}, json={"full_name": "Smoke Alice"}).json()
-B = requests.post(f"{BASE}/v1/admin/providers", headers={**SUH, **JSON}, json={"full_name": "Smoke Bob"}).json()
-A_ID, A_KEY, A_KID = A["id"], A["api_key"], A["key"]["id"]
+A = ensure_provider("Smoke Alice")
+B = ensure_provider("Smoke Bob")
+A_ID, A_KEY, A_KID = A["id"], A["api_key"], A["key_id"]
 B_ID, B_KEY = B["id"], B["api_key"]
 AH, BH = {"X-API-Key": A_KEY}, {"X-API-Key": B_KEY}
 
@@ -1914,6 +2245,8 @@ check("provider cannot use legacy /entities", 403, "GET", "/entities", headers=A
 check("provider cannot use /admin/batch", 403, "POST", "/admin/batch", headers={**AH, **JSON}, json={})
 
 print("== configs ==")
+for leftover in ("smoke_orders", "smoke_customers"):   # children first: leftovers from an interrupted run
+    drop_config(A_KEY, leftover)
 CUST = requests.post(
     f"{BASE}/v1/configs",
     headers={**AH, **YAML},
@@ -2040,6 +2373,11 @@ check("deactivate Alice", 200, "PATCH", f"/v1/admin/providers/{A_ID}", headers={
 check("deactivate Bob", 200, "PATCH", f"/v1/admin/providers/{B_ID}", headers={**SUH, **JSON},
       json={"is_active": False})
 check("inactive provider -> 401", 401, "GET", "/v1/me", headers={"X-API-Key": NEW})
+for pid in (A_ID, B_ID):   # leave no active key behind, so re-runs never accumulate keys
+    keys = next(p for p in requests.get(f"{BASE}/v1/admin/providers", headers=SUH).json()["items"] if p["id"] == pid)["keys"]
+    for k in keys:
+        if not k["revoked_at"]:
+            requests.delete(f"{BASE}/v1/admin/providers/{pid}/keys/{k['id']}", headers=SUH)
 
 print()
 if FAIL == 0:
@@ -2051,38 +2389,7 @@ sys.exit(FAIL)
 
 ---
 
-## Part 8 — Reference, checklist & wrap-up
-
-### 18. Error reference
-
-Every failure uses one envelope: `{"error":{"code":"…","message":"…"}}` (a validation error's `message` is a list).
-
-| Code                                                                                               |      HTTP       | When                                                                                                                                                 |
-| -------------------------------------------------------------------------------------------------- | :-------------: | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `unauthorized`                                                                                     |       401       | missing / wrong / revoked key, inactive provider (adds `WWW-Authenticate: ApiKey`)                                                                   |
-| `forbidden`                                                                                        |       403       | provider key on a superuser/legacy route · write to someone else's config · creating a config for another provider                                   |
-| `not_found`                                                                                        |       404       | unknown **or private** config · row missing or soft-deleted · unknown provider/key · unknown entity on `/scheduler/runs`                             |
-| `validation_error`                                                                                 |       422       | bad query/body shape (e.g. `limit=0`, `mode=bogus`, `format=xml`, missing `entity`)                                                                  |
-| `invalid_config`                                                                                   |       422       | a config (or body) failed validation — the message says exactly why                                                                                  |
-| `invalid_request`                                                                                  |       422       | bad `PATCH` body · empty `configs` in a bundle                                                                                                       |
-| `invalid_provider` / `invalid_label`                                                               |       422       | bad `full_name` / key label                                                                                                                          |
-| `payload_too_large`                                                                                |       413       | config body over `MAX_CONFIG_BYTES`                                                                                                                  |
-| `already_exists`                                                                                   |       409       | config name already used by this owner · provider `full_name` already taken (create or rename)                              |
-| `quota_exceeded`                                                                                   |    409 / 422    | too many configs (**409**) · too many rows (**422**)                                                                                                 |
-| `managed_by_yaml`                                                                                  |       409       | edit/delete of a built-in config                                                                                                                     |
-| `has_dependents`                                                                                   |       409       | change fields of / delete a config others reference                                                                                                  |
-| `confirmation_required`                                                                            |       400       | delete config · change fields · `replace`/`reset` without confirm                                                                                    |
-| `missing_parent_rows`                                                                              |       409       | a child has no parent rows to point at                                                                                                               |
-| `busy`                                                                                             |       409       | another bulk write held the lock > 30 s                                                                                                              |
-| `not_supported`                                                                                    | 400 / 409 / 422 | row delete on a config with no soft-delete field (400) · modifying the system provider (409) · `deletes` in simulate with no soft-delete field (422) |
-| `unknown_field` · `read_only_field` · `invalid_value` · `invalid_reference`                        |       422       | row write validation (`/v1`)                                                                                                                         |
-| `cursor_ahead_of_source`                                                                           |       409       | `since` is beyond the latest version (usually after `reset`)                                                                                         |
-| `duplicate_primary_key`                                                                            |       409       | a seeded insert generated a key that already exists — use a different seed                                                                           |
-| `unsupported_format` · `invalid_since` · `since_not_targeted` · `mixed_owners`                     |       422       | export request problems                                                                                                                              |
-| `unknown_entity` · `counts_not_targeted` · `invalid_mode` · `invalid_batch_size` · `invalid_count` |       422       | legacy `/admin/*` & CLI request problems                                                                                                             |
-| `injected_failure`                                                                                 |       500       | failure injection fired                                                                                                                              |
-
----
+## Part 8 — Checklist & wrap-up
 
 ### 21. Master checklist
 
@@ -2174,6 +2481,13 @@ Tick each box as you verify it. **Section** points back to the details above.
 - [ ] `pytest -v` → 310 passing (§19.5)
 - [ ] `smoke_test.py` → ALL CHECKS PASSED (§20)
 
+#### Idempotent re-run
+
+- [ ] Running §0 → §16 a second time creates no new provider, no new active key and no new config; no step fails with `409 already_exists` (§0.2)
+- [ ] `baseline_data(KEY, CID, seed=42)` twice gives identical ids (§6, §0.2)
+- [ ] `teardown()` leaves no guide config behind, and calling it again does nothing (§0.2)
+- [ ] `smoke_test.py` passes twice in a row (§20)
+
 ---
 
 ### 22. Gotchas worth knowing
@@ -2205,3 +2519,13 @@ Tick each box as you verify it. **Section** points back to the details above.
 - The **`MAX_ROWS_PER_CONFIG` row cap applies to provider configs only** — built-in YAML configs have none (`max_rows: null` in their metrics).
 
 ---
+
+**From making the guide re-runnable**
+
+- **A provider's secret is shown once.** `ensure_provider` keeps it in `.synthetic_state.json`; delete that file and the next run issues exactly one new key (it never creates a second provider).
+- **Providers cannot be deleted** (no route) — only deactivated. That is why the guide reuses them by name instead of creating fresh ones.
+- **`ensure_config` never edits or re-seeds an existing config.** Changing a config's `fields` is destructive and stays an explicit step (§5.7, `?confirm=true`).
+- **A caller cannot choose a primary key**, so `ensure_row` uses a field you control as the row's identity. Rows with random ids are only made repeatable with `baseline_data` (replace + seed).
+- **The same seed twice is a `409 duplicate_primary_key`**, not a silent duplicate — treat it as "already done".
+- **Soft-deleted rows stay in the table and the change log.** Steps that create-then-delete a probe row leave the live data unchanged, but `row_count` and the feed still grow by that row.
+- **Superuser sweeps must be read-only** (`sweep(SU, OID, read_only=True)`): with the superuser key the write requests really succeed.
