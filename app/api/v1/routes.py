@@ -1,18 +1,25 @@
-"""The /v1 API: providers, the configs they publish, and the data generated from them.
+"""The /v1 API: providers, their projects (schemas), the configs (tables) inside them,
+and the data generated from those configs.
 
   identity    GET  /v1/me
   superuser   POST/GET /v1/admin/providers, PATCH .../{id}, POST/DELETE .../{id}/keys
-  configs     POST/GET /v1/configs, POST /v1/configs/validate,
-              GET/PATCH/DELETE /v1/configs/{config_id}
+  projects    POST/GET /v1/projects, GET/PATCH/DELETE /v1/projects/{project_id}
+              GET /v1/projects/{project_id}/ddl, /export     (the whole schema)
+  configs     POST/GET /v1/projects/{project_id}/configs, POST .../configs/validate
+              GET /v1/configs, GET/PATCH/DELETE /v1/configs/{config_id}
   data        /v1/configs/{config_id}/data[/{row_id}], /changes, /export, /ddl, /metrics, /runs
   generate    POST /v1/configs/{config_id}/batch, /simulate
   bundle      GET  /v1/export?configs=a,b
 
-Every route that takes a `config_id` goes through `catalog.resolve`, which is the single
-place the access rules live: reads need ownership or a public config; writes need
-ownership; a private config looks nonexistent (404) to everyone else; the superuser can
-do anything. Routes only ever pass the entry's own scope to the engine, so a provider's
-operations cannot reach another provider's tables.
+provider -> project -> config is schema-like: a project is a schema, a config is a table.
+`ref` fields resolve inside one project, and `is_only_me` is set on the project.
+
+Every route that takes a `config_id` goes through `catalog.resolve`, and every route that
+takes a `project_id` through `catalog.resolve_project`: those are the single places the
+access rules live. Reads need ownership or a public project; writes need ownership; a
+private project (and its configs) looks nonexistent (404) to everyone else; the superuser
+can do anything. Routes only ever pass the entry's own project scope to the engine, so
+an operation cannot reach another project's tables.
 """
 from __future__ import annotations
 
@@ -32,7 +39,7 @@ from ...security.api_keys import Principal, current_principal, require_superuser
 from ...services import entity_ops, registry
 from ...services import metrics as metrics_module
 from ...services.batch import DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, MAX_ROWS_PER_ENTITY, run_batch, run_changes
-from ...services.catalog import Entry, catalog, scrub
+from ...services.catalog import Entry, Project, catalog, scrub
 from ...services.changefeed import CursorAheadError, get_changes
 from ...services.ddl import generate_ddl_labeled
 from ...services.export import build_zip, iter_spool, open_entity_export, parse_since
@@ -47,15 +54,18 @@ Format = Literal["csv", "ndjson", "sql"]
 # =========================================================== identity ====
 @router.get("/me")
 def me(principal: Principal = Depends(current_principal)):
-    """Who this key is, and the quotas that apply to provider-created configs."""
-    owned = None
+    """Who this key is, and the quotas that apply to provider-created projects and configs."""
+    owned = projects = None
     if principal.provider_id:
         owned = sum(1 for e in list(catalog.entries.values())
                     if e.source == "api" and e.provider_id == principal.provider_id)
+        projects = sum(1 for p in list(catalog.projects.values())
+                       if p.source == "api" and p.provider_id == principal.provider_id)
     return {
         "role": principal.role,
         "id": principal.provider_id,
         "full_name": principal.full_name,
+        "projects_owned": projects,
         "configs_owned": owned,
         "limits": get_limits().as_dict(),
     }
@@ -91,7 +101,8 @@ def create_provider(body: ProviderCreate, response: Response,
     unchanged with `200` and `created: false`, and **no key** — only a hash of the original
     is kept, so issue a fresh one via `POST /v1/admin/providers/{id}/keys` if you lost it.
     """
-    provider, created = registry.create_provider(body.full_name, on_exists=on_exists)
+    provider, created = registry.create_provider(
+        body.full_name, on_exists=on_exists)
     if not created:
         response.status_code = 200
         return {**provider, "created": False, "api_key": None, "key": None,
@@ -127,7 +138,7 @@ def revoke_provider_key(provider_id: str, key_id: str):
 
 # ================================================================ configs ====
 def _owner_for(principal: Principal, provider_id: Optional[str]) -> str:
-    """Whose config is being created. Providers act for themselves; the superuser names a
+    """Whose project is being created. Providers act for themselves; the superuser names a
     provider (default: the built-in system provider)."""
     if principal.is_superuser:
         owner = provider_id or registry.SYSTEM_PROVIDER_ID
@@ -136,7 +147,7 @@ def _owner_for(principal: Principal, provider_id: Optional[str]) -> str:
         return owner
     if provider_id and provider_id != principal.provider_id:
         raise ApiError(
-            "forbidden", "you can only create configs for yourself", 403)
+            "forbidden", "you can only create projects for yourself", 403)
     return principal.provider_id  # type: ignore[return-value]
 
 
@@ -144,42 +155,137 @@ async def _body(request: Request) -> Dict[str, Any]:
     return parse_body(await request.body(), request.headers.get("content-type"), get_limits())
 
 
-@router.post("/configs/validate")
-async def validate_config(request: Request, provider_id: Optional[str] = Query(default=None),
-                          principal: Principal = Depends(current_principal)):
-    """Dry run of POST /v1/configs: checks everything, saves nothing, and shows the
-    normalized config (with `version` added if you left it out)."""
+# ============================================================== projects ====
+@router.post("/projects", status_code=201)
+async def create_project(request: Request, provider_id: Optional[str] = Query(default=None),
+                         principal: Principal = Depends(current_principal)):
+    """Create a project: an empty schema that configs (tables) are then published into.
+    Body: `{"name": "shop", "description": "...", "is_only_me": false}`. By default other
+    providers may read (never change) a project and its configs; `is_only_me: true` hides
+    all of it. You are the owner, taken from your API key."""
     raw = await _body(request)
     owner = _owner_for(principal, provider_id)
-    owned = [e for e in list(catalog.entries.values())
-             if e.provider_id == owner]
-    stored, flag = validate(
-        raw, {e.name: e.stored for e in owned if e.source == "api"}, get_limits())
+    project = await run_in_threadpool(catalog.create_project, owner, raw, get_limits())
+    return catalog.describe_project(project, principal, detail=True)
+
+
+@router.get("/projects")
+def list_projects(scope: Literal["mine", "shared", "all"] = "all", principal: Principal = Depends(current_principal)):
+    """Projects you can read. `mine` = yours, `shared` = other providers' public ones."""
+    owners = registry.provider_names()
+    return {"items": [catalog.describe_project(p, principal, owners)
+                      for p in catalog.visible_projects(principal, scope)]}
+
+
+@router.get("/projects/{project_id}")
+def get_project(project_id: str, principal: Principal = Depends(current_principal)):
+    return catalog.describe_project(catalog.resolve_project(project_id, principal, "read"), principal, detail=True)
+
+
+@router.patch("/projects/{project_id}")
+async def patch_project(project_id: str, request: Request, principal: Principal = Depends(current_principal)):
+    """Rename a project, change its `description`, or share / hide it with `is_only_me`."""
+    project = catalog.resolve_project(project_id, principal, "write")
+    patch = await _body(request)
+    project = await run_in_threadpool(catalog.update_project, project, patch)
+    return catalog.describe_project(project, principal, detail=True)
+
+
+@router.delete("/projects/{project_id}")
+def delete_project(project_id: str, confirm: bool = False, principal: Principal = Depends(current_principal)):
+    """Delete a project, every config in it and ALL their data. Needs `?confirm=true`."""
+    project = catalog.resolve_project(project_id, principal, "write")
+    if not confirm:
+        raise ApiError("confirmation_required",
+                       "deleting a project deletes all of its configs and their data; confirm it (confirm=true)", 400)
+    removed = catalog.delete_project(project)
+    return {"deleted": True, "id": project.id, "name": project.name, "configs_deleted": removed}
+
+
+@router.get("/projects/{project_id}/ddl", response_class=PlainTextResponse)
+def ddl_project(project_id: str, dialect: Dialect = "sqlite", principal: Principal = Depends(current_principal)):
+    """The whole schema: CREATE TABLE / CREATE INDEX for every config in the project, under
+    the names you chose, parents first. For `postgresql` it starts with
+    `CREATE SCHEMA IF NOT EXISTS <project>` and `SET search_path`, so the project really is
+    a schema there."""
+    project = catalog.resolve_project(project_id, principal, "read")
+    members = catalog.project_entries(project.id)
+    configs, _ = catalog.project_scope(project.id)
+    return generate_ddl_labeled(configs, catalog.project_labels(project.id), [e.physical for e in members],
+                                dialect, include_parents=True, schema=project.name)
+
+
+@router.get("/projects/{project_id}/export")
+def export_project(
+    project_id: str,
+    fmt: Format = Query(default="csv", alias="format"),
+    dialect: Dialect = "sqlite",
+    include_deleted: bool = False,
+    since: List[str] = Query(
+        default=[], description="<config_id>=<version>: that config's changes instead of a snapshot"),
+    principal: Principal = Depends(current_principal),
+):
+    """The whole project as a zip: schema.sql, one data file per config (parents first) and a
+    manifest.json. `since=<config_id>=<version>` swaps a config's snapshot for its changes."""
+    project = catalog.resolve_project(project_id, principal, "read")
+    members = catalog.project_entries(project.id)
+    if not members:
+        raise ApiError("empty_project",
+                       f"project '{project.name}' has no configs yet", 409)
+    return _zip_response(project, members, fmt, dialect, include_deleted, since)
+
+
+# ================================================================ configs ====
+@router.post("/projects/{project_id}/configs/validate")
+async def validate_config(project_id: str, request: Request,
+                          principal: Principal = Depends(current_principal)):
+    """Dry run of POST /v1/projects/{project_id}/configs: checks everything, saves nothing,
+    and shows the normalized config (with `version` added if you left it out)."""
+    project = catalog.resolve_project(project_id, principal, "write")
+    raw = await _body(request)
+    if project.source == "yaml":
+        raise ApiError("managed_by_yaml",
+                       "the built-in examples project is defined by the files in configs/", 409)
+    members = catalog.project_entries(project.id)
+    stored = validate(raw, {e.name: e.stored for e in members}, get_limits())
     return {
         "valid": True,
-        "name_available": stored.entity not in {e.name for e in owned},
-        "is_only_me": bool(flag),
+        "project": {"id": project.id, "name": project.name},
+        "name_available": stored.entity not in {e.name for e in members},
         "config": normalize(stored),
     }
 
 
-@router.post("/configs", status_code=201)
-async def create_config(request: Request, provider_id: Optional[str] = Query(default=None),
+@router.post("/projects/{project_id}/configs", status_code=201)
+async def create_config(project_id: str, request: Request,
                         principal: Principal = Depends(current_principal)):
-    """Publish a config. Send JSON (`Content-Type: application/json`) or YAML — a file from
-    `configs/` posts as-is. Add `is_only_me: true` to keep it private; by default other
-    providers may read (never change) it. You are the owner, taken from your API key."""
+    """Publish a config (a table) into a project. Send JSON (`Content-Type: application/json`)
+    or YAML — a file from `configs/` posts as-is. `ref` fields can point at configs of this
+    project. Visibility is the project's, not the config's."""
+    project = catalog.resolve_project(project_id, principal, "write")
     raw = await _body(request)
-    owner = _owner_for(principal, provider_id)
-    entry, seeded = await run_in_threadpool(catalog.create, owner, raw, get_limits())
+    entry, seeded = await run_in_threadpool(catalog.create, project, raw, get_limits())
     return {**catalog.describe(entry, principal, detail=True), "seeded_rows": seeded}
 
 
-@router.get("/configs")
-def list_configs(scope: Literal["mine", "shared", "all"] = "all", principal: Principal = Depends(current_principal)):
-    """Configs you can read. `mine` = yours, `shared` = other providers' public ones."""
+@router.get("/projects/{project_id}/configs")
+def list_project_configs(project_id: str, principal: Principal = Depends(current_principal)):
+    """The configs (tables) in one project."""
+    project = catalog.resolve_project(project_id, principal, "read")
     owners = registry.provider_names()
-    return {"items": [catalog.describe(e, principal, owners) for e in catalog.visible(principal, scope)]}
+    return {"project": {"id": project.id, "name": project.name},
+            "items": [catalog.describe(e, principal, owners)
+                      for e in catalog.visible(principal, "all", project.id)]}
+
+
+@router.get("/configs")
+def list_configs(scope: Literal["mine", "shared", "all"] = "all", project_id: Optional[str] = None,
+                 principal: Principal = Depends(current_principal)):
+    """Configs you can read, across projects (narrow with `project_id`). `mine` = yours,
+    `shared` = other providers' public ones."""
+    owners = registry.provider_names()
+    return {"items": [catalog.describe(e, principal, owners)
+                      for e in catalog.visible(principal, scope, project_id)]}
 
 
 @router.get("/configs/{config_id}")
@@ -190,9 +296,10 @@ def get_config(config_id: str, principal: Principal = Depends(current_principal)
 @router.patch("/configs/{config_id}")
 async def patch_config(config_id: str, request: Request, confirm: bool = False,
                        principal: Principal = Depends(current_principal)):
-    """Change `is_only_me`, `seed`, `update_schedule`, `failure_injection` (each merged into
-    what's there) or `fields` (replaced; this deletes and re-seeds the data, so it needs
-    `?confirm=true`, and isn't allowed while another config references this one)."""
+    """Change `seed`, `update_schedule`, `failure_injection` (each merged into what's there)
+    or `fields` (replaced; this deletes and re-seeds the data, so it needs `?confirm=true`,
+    and isn't allowed while another config references this one). Sharing is a project
+    setting: PATCH /v1/projects/{project_id}."""
     entry = catalog.resolve(config_id, principal, "write")
     patch = await _body(request)
     entry, seeded = await run_in_threadpool(catalog.update, entry, patch, confirm, get_limits())
@@ -422,6 +529,46 @@ def simulate_config(config_id: str, req: SimulateRequest, principal: Principal =
 
 
 # ================================================================ bundle ====
+def _zip_response(project: Project, entries: List[Entry], fmt: str, dialect: str,
+                  include_deleted: bool, since: List[str]) -> StreamingResponse:
+    """A zip of `entries` (all from `project`): schema.sql, a data file per config, a manifest."""
+    cfgs, tbls = catalog.project_scope(project.id)
+    labels = catalog.project_labels(project.id)
+
+    by_id = {e.id: e for e in entries}
+    since_by_table: Dict[str, int] = {}
+    for config_id, version in parse_since(since).items():
+        if config_id not in by_id:
+            raise ApiError(
+                "since_not_targeted", f"since given for '{config_id}', which is not in this export", 422)
+        since_by_table[by_id[config_id].physical] = version
+
+    try:
+        spool = build_zip(
+            engine, tbls, cfgs, fmt=fmt, dialect=dialect, entities=[
+                e.physical for e in entries],
+            include_deleted=include_deleted, since=since_by_table, labels=labels,
+            schema=project.name,
+            manifest_extra={"project": {
+                "id": project.id, "name": project.name}},
+            handoff=(
+                "Load each snapshot in load_order"
+                + (f" (for postgresql, run SET search_path TO {project.name}; first: schema.sql does)"
+                   if dialect == "postgresql" else "")
+                + ", then catch up with GET /v1/configs/<config_id>/export?since=<snapshot_cursor> "
+                  "(or /changes?since=<snapshot_cursor>)."
+            ),
+            file_extra={e.physical: {"config_id": e.id} for e in entries},
+        )
+    except ApiError as exc:
+        raise ApiError(exc.code, scrub(exc.message, labels), exc.status)
+    return StreamingResponse(
+        iter_spool(spool), media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{project.name}-export.zip"'},
+    )
+
+
 @router.get("/export")
 def export_bundle(
     configs: List[str] = Query(...,
@@ -433,8 +580,9 @@ def export_bundle(
         default=[], description="<config_id>=<version>: that config's changes instead of a snapshot"),
     principal: Principal = Depends(current_principal),
 ):
-    """A zip with schema.sql, one data file per config (parents first) and a manifest.json.
-    All configs must have the same owner, so table names and relationships stay consistent."""
+    """A zip with schema.sql, one data file per chosen config (parents first) and a
+    manifest.json. All configs must be in the same project, so table names and relationships
+    stay consistent. (To export a whole project, use GET /v1/projects/{project_id}/export.)"""
     ids = list(dict.fromkeys(i.strip()
                for raw in configs for i in raw.split(",") if i.strip()))
     if not ids:
@@ -442,36 +590,7 @@ def export_bundle(
                        "give at least one config id in `configs`", 422)
     entries = [catalog.resolve(i, principal, "read") for i in ids]
     first = entries[0]
-    if any(catalog.scope_key(e) != catalog.scope_key(first) for e in entries):
+    if any(e.project_id != first.project_id for e in entries):
         raise ApiError(
-            "mixed_owners", "a bundle holds configs from one owner, so names and relationships stay consistent", 422)
-    cfgs, tbls = catalog.scope(first)
-    labels = catalog.labels(first)
-
-    by_id = {e.id: e for e in entries}
-    since_by_table: Dict[str, int] = {}
-    for config_id, version in parse_since(since).items():
-        if config_id not in by_id:
-            raise ApiError(
-                "since_not_targeted", f"since given for '{config_id}', which is not in `configs`", 422)
-        since_by_table[by_id[config_id].physical] = version
-
-    try:
-        spool = build_zip(
-            engine, tbls, cfgs, fmt=fmt, dialect=dialect, entities=[
-                e.physical for e in entries],
-            include_deleted=include_deleted, since=since_by_table, labels=labels,
-            handoff=(
-                "Load each snapshot in load_order, then catch up with "
-                "GET /v1/configs/<config_id>/export?since=<snapshot_cursor> "
-                "(or /changes?since=<snapshot_cursor>)."
-            ),
-            file_extra={e.physical: {"config_id": e.id} for e in entries},
-        )
-    except ApiError as exc:
-        raise ApiError(exc.code, scrub(exc.message, labels), exc.status)
-    return StreamingResponse(
-        iter_spool(spool), media_type="application/zip",
-        headers={
-            "Content-Disposition": 'attachment; filename="synthetic-export.zip"'},
-    )
+            "mixed_projects", "a bundle holds configs from one project, so names and relationships stay consistent", 422)
+    return _zip_response(catalog.project_of(first), entries, fmt, dialect, include_deleted, since)

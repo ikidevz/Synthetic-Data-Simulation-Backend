@@ -12,7 +12,7 @@ from app.config.entities import load_entity_configs
 from app.services.generator import generate_row
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
-CONFIG_DIR = os.path.join(ROOT, "configs")
+from conftest import TEST_CONFIG_DIR as CONFIG_DIR  # noqa: E402  (a tests-owned dir, not configs/)
 VOLATILE = {"created_at", "updated_at", "version"}  # not pinned by a seed
 
 

@@ -21,12 +21,13 @@ def generate_ddl(
     dialect: str = "sqlite",
     include_system: bool = False,
     meta: Optional[MetaData] = None,
+    preamble: str = "",
 ) -> str:
     """Return runnable DDL for every entity table, parents before children.
 
     include_system=True also emits the change_log and scheduler_runs tables
     the app uses internally. Statements use IF NOT EXISTS so the script can
-    be re-run safely.
+    be re-run safely. `preamble` is emitted between the header and the first statement.
     """
     if dialect not in DIALECTS:
         raise ValueError(
@@ -52,7 +53,8 @@ def generate_ddl(
                     dialect=dialect_obj)).strip() + ";"
             )
 
-    header = f"-- Generated from entity configs (dialect: {dialect})\n\n"
+    header = f"-- Generated from entity configs (dialect: {dialect})\n\n" + \
+        preamble
     return header + "\n\n".join(statements) + "\n"
 
 
@@ -62,6 +64,7 @@ def generate_ddl_labeled(
     selected: Iterable[str],
     dialect: str = "sqlite",
     include_parents: bool = False,
+    schema: Optional[str] = None,
 ) -> str:
     """DDL under the provider's own table names instead of the namespaced physical ones.
 
@@ -70,6 +73,10 @@ def generate_ddl_labeled(
     logical names (foreign keys included), so the script reads as the provider wrote
     it. `include_parents` adds every table the selection references, directly or not,
     so the script runs on its own.
+
+    `schema` is the project's name. PostgreSQL has real schemas, so there the script opens
+    with CREATE SCHEMA IF NOT EXISTS and SET search_path and the project becomes a schema;
+    SQLite has none, so it only gets a comment naming the project.
     """
     meta = MetaData()
     logical: Dict[str, EntityConfig] = {}
@@ -90,4 +97,12 @@ def generate_ddl_labeled(
                 if f.type == "ref" and f.ref_entity not in wanted:
                     wanted.add(f.ref_entity)
                     stack.append(f.ref_entity)
-    return generate_ddl({n: tables[n] for n in wanted}, dialect=dialect, meta=meta)
+    preamble = ""
+    if schema:
+        if dialect == "postgresql":
+            preamble = (f"-- Project (schema): {schema}\n"
+                        f"CREATE SCHEMA IF NOT EXISTS {schema};\n"
+                        f"SET search_path TO {schema};\n\n")
+        else:
+            preamble = f"-- Project: {schema} (SQLite has no schemas; the tables below are its configs)\n\n"
+    return generate_ddl({n: tables[n] for n in wanted}, dialect=dialect, meta=meta, preamble=preamble)

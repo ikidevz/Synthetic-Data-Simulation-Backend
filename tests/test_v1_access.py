@@ -1,9 +1,14 @@
 """Who can see and change what. This is the isolation guarantee, tested route by route:
 
-  owner       reads and writes their configs
-  other       reads another provider's config unless it is is_only_me; never writes it
-  private     a config with is_only_me looks nonexistent (404) to everyone but its owner
+  owner       reads and writes their projects and the configs inside them
+  other       reads another provider's project (and its configs) unless it is is_only_me;
+              never writes it
+  private     a project with is_only_me, and every config in it, looks nonexistent (404)
+              to everyone but its owner
   superuser   reads and writes everything
+
+Visibility belongs to the PROJECT (a schema is shared or hidden as a unit), so "a private
+config" below means a config that lives in a private project.
 """
 import io
 import json
@@ -12,7 +17,7 @@ import zipfile
 
 import pytest
 
-from conftest import customers_cfg, orders_cfg, publish
+from conftest import customers_cfg, make_project, orders_cfg, publish
 
 NAMESPACED = re.compile(r"\bd_[0-9a-f]{10}_")
 
@@ -20,13 +25,15 @@ NAMESPACED = re.compile(r"\bd_[0-9a-f]{10}_")
 @pytest.fixture(scope="module")
 def world(client, su, alice, bob):
     pub = publish(client, alice, customers_cfg("acc_pub", count=3))
+    hidden = make_project(client, alice, "acc_hidden", is_only_me=True)
     priv = publish(client, alice, customers_cfg(
-        "acc_priv", count=3, is_only_me=True))
+        "acc_priv", count=3), project=hidden["id"])
     rows = {}
     for key, made in (("pub", pub), ("priv", priv)):
         rows[key] = client.get(
             f"/v1/configs/{made['id']}/data?limit=10", headers=alice["h"]).json()["items"]
-    return {"pub": pub["id"], "priv": priv["id"], "row": {k: [r["customer_id"] for r in v] for k, v in rows.items()}}
+    return {"pub": pub["id"], "priv": priv["id"], "priv_project": hidden["id"],
+            "pub_project": pub["project"]["id"], "row": {k: [r["customer_id"] for r in v] for k, v in rows.items()}}
 
 
 # (label, method, path with {id} and {row}, json body, status the OWNER gets)
@@ -116,18 +123,42 @@ def test_a_private_config_is_indistinguishable_from_one_that_does_not_exist(clie
     assert world["priv"] not in real.text.replace(f"'{world['priv']}'", "")
 
 
-def test_flipping_is_only_me_takes_effect_immediately(client, alice, bob):
-    made = publish(client, alice, customers_cfg("acc_flip"))
+def test_flipping_a_projects_is_only_me_takes_effect_immediately(client, alice, bob):
+    project = make_project(client, alice, "acc_flip")
+    made = publish(client, alice, customers_cfg(
+        "acc_flip"), project=project["id"])
     url = f"/v1/configs/{made['id']}/data"
+    purl = f"/v1/projects/{project['id']}"
     assert client.get(url, headers=bob["h"]).status_code == 200
-    client.patch(f"/v1/configs/{made['id']}",
-                 json={"is_only_me": True}, headers=alice["h"])
+    assert client.patch(
+        purl, json={"is_only_me": True}, headers=alice["h"]).status_code == 200
+    # the config vanished...
     assert client.get(url, headers=bob["h"]).status_code == 404
+    # ...and so did its project
+    assert client.get(purl, headers=bob["h"]).status_code == 404
     assert made["id"] not in {i["id"] for i in client.get(
         "/v1/configs", headers=bob["h"]).json()["items"]}
-    client.patch(f"/v1/configs/{made['id']}",
-                 json={"is_only_me": False}, headers=alice["h"])
+    assert project["id"] not in {i["id"] for i in client.get(
+        "/v1/projects", headers=bob["h"]).json()["items"]}
+    client.patch(purl, json={"is_only_me": False}, headers=alice["h"])
     assert client.get(url, headers=bob["h"]).status_code == 200
+
+
+def test_visibility_cannot_be_set_on_a_single_config(client, alice, bob):
+    """A shared config must never point at a hidden parent, so there is no per-config switch."""
+    project = make_project(client, alice, "acc_noswitch")
+    made = publish(client, alice, customers_cfg(
+        "acc_noswitch"), project=project["id"])
+    resp = client.patch(
+        f"/v1/configs/{made['id']}", json={"is_only_me": True}, headers=alice["h"])
+    assert resp.status_code == 422 and "PATCH /v1/projects" in resp.json()[
+        "error"]["message"]
+    resp = client.post(f"/v1/projects/{project['id']}/configs",
+                       json=customers_cfg("acc_noswitch2", is_only_me=True), headers=alice["h"])
+    assert resp.status_code == 422 and "project setting" in resp.json()[
+        "error"]["message"]
+    assert client.get(
+        f"/v1/configs/{made['id']}/data", headers=bob["h"]).status_code == 200
 
 
 def test_readers_of_a_public_config_see_the_owners_new_data(client, alice, bob):
@@ -223,46 +254,63 @@ def test_change_feeds_are_per_config(client, alice, bob):
 
 
 # ----------------------------------------------------------- the superuser ----
-def test_the_superuser_can_create_configs_on_behalf_of_a_provider(client, su, alice, bob):
+def test_the_superuser_can_create_projects_and_configs_on_behalf_of_a_provider(client, su, alice, bob):
+    made_project = client.post(f"/v1/projects?provider_id={alice['id']}",
+                               json={"name": "su_made"}, headers=su)
+    assert made_project.status_code == 201 and made_project.json()[
+        "owner"]["id"] == alice["id"]
+    pid = made_project.json()["id"]
     made = client.post(
-        f"/v1/configs?provider_id={alice['id']}", json=customers_cfg("su_made", count=2), headers=su)
+        f"/v1/projects/{pid}/configs", json=customers_cfg("su_made", count=2), headers=su)
+    # the config belongs to the PROJECT's owner, not to whoever typed the request
     assert made.status_code == 201 and made.json()[
         "owner"]["id"] == alice["id"]
-    assert client.get(
-        # hers now
+    assert client.get(  # hers now
         f"/v1/configs/{made.json()['id']}/data", headers=alice["h"]).status_code == 200
-    # public by default
-    assert client.get(
+    assert client.get(  # public by default
         f"/v1/configs/{made.json()['id']}/data", headers=bob["h"]).status_code == 200
-    assert client.post("/v1/configs?provider_id=prov_nope",
-                       json=customers_cfg("su_x"), headers=su).status_code == 404
+    assert client.post("/v1/projects?provider_id=prov_nope",
+                       json={"name": "su_x"}, headers=su).status_code == 404
     default = client.post(
-        "/v1/configs", json=customers_cfg("su_system_made", count=1), headers=su)
+        "/v1/projects", json={"name": "su_system_made"}, headers=su)
     assert default.status_code == 201 and default.json()[
+        "owner"]["id"] == "prov_system"
+    cfg = client.post(f"/v1/projects/{default.json()['id']}/configs",
+                      json=customers_cfg("su_system_made", count=1), headers=su)
+    assert cfg.status_code == 201 and cfg.json()[
         "owner"]["id"] == "prov_system"
 
 
-def test_a_provider_cannot_create_configs_for_someone_else(client, alice, bob):
-    resp = client.post(
-        f"/v1/configs?provider_id={bob['id']}", json=customers_cfg("sneaky"), headers=alice["h"])
+def test_a_provider_cannot_create_projects_or_configs_for_someone_else(client, alice, bob):
+    resp = client.post(f"/v1/projects?provider_id={bob['id']}",
+                       json={"name": "sneaky"}, headers=alice["h"])
     assert resp.status_code == 403 and resp.json()[
         "error"]["code"] == "forbidden"
-    assert client.post(f"/v1/configs?provider_id={alice['id']}", json=customers_cfg(
-        "sneaky_ok"), headers=alice["h"]).status_code == 201
+    assert client.post(f"/v1/projects?provider_id={alice['id']}", json={"name": "sneaky_ok"},
+                       headers=alice["h"]).status_code == 201
+    # nor can she add a table to a schema that is only Bob's, even a public one
+    bobs = make_project(client, bob, "bob_public")
+    resp = client.post(f"/v1/projects/{bobs['id']}/configs", json=customers_cfg("intruder"),
+                       headers=alice["h"])
+    assert resp.status_code == 403 and resp.json()[
+        "error"]["code"] == "forbidden"
 
 
 def test_the_superuser_can_change_and_delete_any_providers_config(client, su, alice):
+    project = make_project(client, alice, "su_edit", is_only_me=True)
     made = publish(client, alice, customers_cfg(
-        "su_edit", count=2, is_only_me=True))
+        "su_edit", count=2), project=project["id"])
     cid = made["id"]
-    assert client.patch(
-        f"/v1/configs/{cid}", json={"is_only_me": False}, headers=su).json()["is_only_me"] is False
+    assert client.patch(f"/v1/projects/{project['id']}", json={"is_only_me": False},
+                        headers=su).json()["is_only_me"] is False
     assert client.post(
         f"/v1/configs/{cid}/data", json={"name": "Su Wrote"}, headers=su).status_code == 201
     assert client.delete(
         f"/v1/configs/{cid}?confirm=true", headers=su).status_code == 200
     assert client.get(f"/v1/configs/{cid}",
                       headers=alice["h"]).status_code == 404
+    assert client.delete(
+        f"/v1/projects/{project['id']}?confirm=true", headers=su).status_code == 200
 
 
 def test_the_superuser_can_write_to_the_built_in_examples_but_providers_cannot(client, su, alice):
@@ -278,8 +326,9 @@ def test_bundles_respect_access_and_use_your_own_names(client, alice, bob):
     parent = publish(client, alice, customers_cfg("bun_parent", count=3))
     child = publish(client, alice, orders_cfg(
         "bun_parent", name="bun_child", count=4))
+    hidden = make_project(client, alice, "bun_hidden", is_only_me=True)
     private = publish(client, alice, customers_cfg(
-        "bun_private", is_only_me=True))
+        "bun_private"), project=hidden["id"])
     ids = f"{parent['id']},{child['id']}"
 
     # Bob may read public configs
@@ -304,14 +353,17 @@ def test_bundles_respect_access_and_use_your_own_names(client, alice, bob):
                       headers=alice["h"]).status_code == 422
 
 
-def test_a_bundle_holds_one_owners_configs(client, su, alice, bob):
+def test_a_bundle_holds_one_projects_configs(client, su, alice, bob):
     a = publish(client, alice, customers_cfg("mix_a"))
     b = publish(client, bob, customers_cfg("mix_b"))
+    other = make_project(client, alice, "mix_other")
+    a2 = publish(client, alice, customers_cfg("mix_a2"), project=other["id"])
     for who in (alice["h"], su):
-        resp = client.get(
-            f"/v1/export?configs={a['id']},{b['id']}", headers=who)
-        assert resp.status_code == 422 and resp.json(
-        )["error"]["code"] == "mixed_owners"
+        for ids in (f"{a['id']},{b['id']}",      # two owners
+                    f"{a['id']},{a2['id']}"):    # one owner, two projects
+            resp = client.get(f"/v1/export?configs={ids}", headers=who)
+            assert resp.status_code == 422 and resp.json(
+            )["error"]["code"] == "mixed_projects"
 
 
 def test_a_bundle_can_mix_changes_and_snapshots(client, alice):
@@ -336,12 +388,13 @@ def test_every_v1_route_with_a_config_id_goes_through_the_access_check(client, b
 
     checked = 0
     for route in client.app.routes:
-        if not (isinstance(route, APIRoute) and route.path.startswith("/v1/configs/{config_id}")):
+        if not (isinstance(route, APIRoute) and route.path.startswith(("/v1/configs/{config_id}", "/v1/projects/{project_id}"))):
             continue
         for method in sorted(route.methods):
-            url = route.path.replace("{config_id}", world["priv"]).replace(
-                "{row_id}", world["row"]["priv"][0])
+            url = (route.path.replace("{config_id}", world["priv"])
+                   .replace("{project_id}", world["priv_project"])
+                   .replace("{row_id}", world["row"]["priv"][0]))
             resp = client.request(method, url, json={}, headers=bob["h"])
             assert resp.status_code == 404, f"{method} {route.path} answered {resp.status_code} to a stranger on a private config"
             checked += 1
-    assert checked >= 15
+    assert checked >= 22

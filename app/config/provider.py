@@ -1,4 +1,4 @@
-"""Validation for configs that providers submit through the API.
+"""Validation for projects and configs that providers submit through the API.
 
 The YAML files in `configs/` are written by the operator, so the loader in
 `entities.py` only checks them for shape. A config arriving over HTTP comes from
@@ -13,6 +13,10 @@ job — so it gets the strict treatment here:
   * the bookkeeping the engine depends on is enforced (a `version` column, a uuid key)
 
 `to_runtime` then maps a validated config onto its namespaced physical table.
+
+A config lives inside a *project* (a schema: a named group of configs). `ref` fields can
+only point at configs of the same project, and `is_only_me` is a property of the project,
+not of a config.
 """
 from __future__ import annotations
 
@@ -42,7 +46,9 @@ FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 # `schema` / `manifest` are file names inside an export bundle (schema.sql, manifest.json).
 RESERVED_NAMES = frozenset({"schema", "manifest"})
 TOP_LEVEL_KEYS = frozenset({"entity", "name", "fields", "seed",
-                           "update_schedule", "failure_injection", "is_only_me"})
+                           "update_schedule", "failure_injection"})
+PROJECT_KEYS = frozenset({"name", "description", "is_only_me"})
+MAX_DESCRIPTION = 500
 MAX_ENUM_VALUES = 50
 MAX_ENUM_VALUE_LENGTH = 64
 MAX_KEY_LABEL_LENGTH = 64
@@ -53,10 +59,13 @@ MAX_JITTER_SECONDS = 3600
 
 @dataclass(frozen=True)
 class Limits:
-    """Quotas for provider-created configs. Each is an environment variable, so a
-    deployment can tighten (a 0.5 GB free database) or loosen them."""
+    """Quotas for provider-created projects and configs. Each is an environment variable,
+    so a deployment can tighten (a 0.5 GB free database) or loosen them."""
 
-    max_configs: int = 10           # MAX_CONFIGS_PER_PROVIDER
+    max_projects: int = 3           # MAX_PROJECTS_PER_PROVIDER
+    max_configs_per_project: int = 10  # MAX_CONFIGS_PER_PROJECT
+    # MAX_CONFIGS_PER_PROVIDER  (across ALL of a provider's projects: the storage ceiling)
+    max_configs: int = 10
     max_fields: int = 40            # MAX_FIELDS_PER_CONFIG
     max_initial_count: int = 10_000  # MAX_INITIAL_COUNT
     # MAX_ROWS_PER_CONFIG  (total rows, soft-deleted included)
@@ -80,6 +89,8 @@ def _env_int(name: str, default: int) -> int:
 def get_limits() -> Limits:
     """Read at call time, so changing the environment (or a test) takes effect at once."""
     return Limits(
+        max_projects=_env_int("MAX_PROJECTS_PER_PROVIDER", 3),
+        max_configs_per_project=_env_int("MAX_CONFIGS_PER_PROJECT", 10),
         max_configs=_env_int("MAX_CONFIGS_PER_PROVIDER", 10),
         max_fields=_env_int("MAX_FIELDS_PER_CONFIG", 40),
         max_initial_count=_env_int("MAX_INITIAL_COUNT", 10_000),
@@ -160,10 +171,10 @@ def validate(
     limits: Limits,
     *,
     forced_name: Optional[str] = None,
-) -> Tuple[EntityConfig, Optional[bool]]:
-    """Validate a provider's config. Returns (normalized config, is_only_me or None).
+) -> EntityConfig:
+    """Validate a config submitted into a project. Returns the normalized config.
 
-    `existing` is {logical name: config} for the provider's OTHER configs — the only
+    `existing` is {logical name: config} for the project's OTHER configs — the only
     things a `ref` field may point at. `forced_name` is used when editing a config
     (its name can't change). Raises ApiError("invalid_config", ..., 422).
     """
@@ -172,14 +183,14 @@ def validate(
             "the config must be an object (a mapping of keys to values)")
     raw = dict(raw)
 
+    if "is_only_me" in raw:
+        raise config_error(
+            "is_only_me is a project setting, not a config setting: set it on the project "
+            "(POST /v1/projects, PATCH /v1/projects/{project_id})")
     unknown = sorted(set(raw) - TOP_LEVEL_KEYS)
     if unknown:
         raise config_error(
             f"unknown top-level key(s): {unknown}. Allowed: {sorted(TOP_LEVEL_KEYS)}")
-
-    only_me = raw.pop("is_only_me", None)
-    if only_me is not None and not isinstance(only_me, bool):
-        raise config_error("is_only_me must be true or false")
 
     entity, alias = raw.pop("entity", None), raw.pop("name", None)
     if entity is not None and alias is not None and entity != alias:
@@ -275,8 +286,9 @@ def validate(
                     f"field '{fname}': a config can't reference itself")
             if f.ref_entity not in existing:
                 raise config_error(
-                    f"field '{fname}' references '{f.ref_entity}', which is not one of your configs "
-                    f"(yours: {sorted(existing) or 'none yet'}). Create the parent first; refs can only point at your own configs."
+                    f"field '{fname}' references '{f.ref_entity}', which is not one of this project's "
+                    f"configs (this project has: {sorted(existing) or 'none yet'}). Create the parent "
+                    f"first; refs can only point at configs in the same project."
                 )
         elif f.ref_entity is not None:
             raise config_error(
@@ -334,7 +346,47 @@ def validate(
     except Exception as exc:  # e.g. an unknown iki key_label, or a bad ik_options
         raise config_error(f"this config can't generate data: {exc}")
 
-    return cfg, only_me
+    return cfg
+
+
+def validate_project(raw: Any, *, patch: bool = False) -> Dict[str, Any]:
+    """Validate a project body. Returns only the keys that were given (so a PATCH can send
+    one), with `name` checked against the same rules as a config name: it becomes the
+    schema name in exports, so it must be a plain lowercase identifier."""
+    if not isinstance(raw, dict):
+        raise ApiError("invalid_project",
+                       "the project must be an object (a mapping of keys to values)", 422)
+    unknown = sorted(set(raw) - PROJECT_KEYS)
+    if unknown:
+        raise ApiError("invalid_project",
+                       f"unknown key(s): {unknown}. Allowed: {sorted(PROJECT_KEYS)}", 422)
+    out: Dict[str, Any] = {}
+    if "name" in raw or not patch:
+        name = raw.get("name")
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            raise ApiError(
+                "invalid_project",
+                "name must be 1-32 characters: a lowercase letter, then lowercase letters, "
+                "digits or underscores", 422)
+        if name in RESERVED_NAMES:
+            raise ApiError("invalid_project",
+                           f"'{name}' is reserved; pick another name", 422)
+        out["name"] = name
+    if "description" in raw:
+        desc = raw["description"]
+        if desc is not None and (not isinstance(desc, str) or len(desc) > MAX_DESCRIPTION):
+            raise ApiError("invalid_project",
+                           f"description must be text of at most {MAX_DESCRIPTION} characters", 422)
+        out["description"] = desc
+    if "is_only_me" in raw:
+        if not isinstance(raw["is_only_me"], bool):
+            raise ApiError("invalid_project",
+                           "is_only_me must be true or false", 422)
+        out["is_only_me"] = raw["is_only_me"]
+    if patch and not out:
+        raise ApiError("invalid_request",
+                       f"send at least one of: {sorted(PROJECT_KEYS)}", 422)
+    return out
 
 
 def _check_no_cycle(name: str, fields: Dict[str, FieldConfig], existing: Dict[str, EntityConfig]) -> None:

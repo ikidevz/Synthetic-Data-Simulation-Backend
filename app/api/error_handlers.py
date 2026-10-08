@@ -52,5 +52,6 @@ def batch_http_error(exc: BatchError) -> HTTPException:
 def register(app: FastAPI) -> None:
     """Install every handler on `app`."""
     app.add_exception_handler(HTTPException, http_exception_handler)
-    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(RequestValidationError,
+                              validation_exception_handler)
     app.add_exception_handler(ApiError, api_error_handler)

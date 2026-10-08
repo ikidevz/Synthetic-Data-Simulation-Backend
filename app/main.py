@@ -9,9 +9,10 @@ all driven entirely by the YAML configs, with no per-entity code.
 Two surfaces share one engine:
   * the legacy routes (/orders, /admin/batch, /metrics, ...) serve the built-in YAML
     entities and need a SUPERUSER key;
-  * /v1 (app/api/v1/routes.py) lets providers publish their own configs and read or
-    manage the data generated from them, with the access rules in
-    app/services/catalog.py.
+  * /v1 (app/api/v1/routes.py) lets providers create projects (schemas), publish configs
+    (tables) into them, and read or manage the data generated from them, with the access
+    rules in app/services/catalog.py. The built-in YAML entities appear there as one
+    read-only project, `examples`.
 
 This module is the entrypoint only: it builds the app, owns the process-wide
 CONFIGS / TABLES state, seeds it, and registers the routes. Everything it calls
@@ -356,8 +357,10 @@ def on_startup():
     get_limits()                         # fail fast on a malformed MAX_* quota variable
     CONFIGS = load_entity_configs(CONFIG_DIR)
     TABLES = models.build_tables(CONFIGS)
-    # built-in entities + the provider registry
+    # built-in entities + the provider/project registry
     models.metadata.create_all(engine)
+    # a database from before projects: file its configs under a project (idempotent)
+    registry.migrate_to_projects()
     # register YAML examples; rebuild provider configs
     catalog.load(CONFIGS, TABLES)
     # ...and any provider table that doesn't exist yet

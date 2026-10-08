@@ -274,6 +274,8 @@ def write_bundle(
     labels: Optional[Dict[str, str]] = None,
     handoff: Optional[str] = None,
     file_extra: Optional[Dict[str, Dict[str, Any]]] = None,
+    schema: Optional[str] = None,
+    manifest_extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Stream schema.sql + one file per entity + manifest.json through `add_file`
     (which is handed a file name and an iterable of text chunks and must consume it).
@@ -282,7 +284,9 @@ def write_bundle(
     `labels` maps an entity's key to the name shown in file names, SQL and the
     manifest (a provider's configs are keyed by namespaced table names but exported
     under their own). `handoff` replaces the manifest's catch-up hint, and
-    `file_extra` merges extra keys into an entity's manifest entry."""
+    `file_extra` merges extra keys into an entity's manifest entry. `schema` is the project
+    name (see `generate_ddl_labeled`) and `manifest_extra` merges extra top-level keys into
+    the manifest."""
     since = since or {}
     labels = labels or {}
 
@@ -307,7 +311,7 @@ def write_bundle(
         schema_name = "schema.sql"
         if labels:
             ddl_text = generate_ddl_labeled(
-                configs, labels, snapshots, dialect=dialect)
+                configs, labels, snapshots, dialect=dialect, schema=schema)
         else:
             ddl_text = generate_ddl(
                 {n: tables[n] for n in snapshots}, dialect=dialect)
@@ -353,6 +357,7 @@ def write_bundle(
             "/<entity>/export?since=<snapshot_cursor> or /<entity>/changes?since=<snapshot_cursor>."
         ),
     }
+    manifest.update(manifest_extra or {})
     add_file("manifest.json", [json.dumps(manifest, indent=2) + "\n"])
     return manifest
 

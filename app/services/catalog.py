@@ -1,26 +1,40 @@
-"""The live catalog: every published config, the table that holds its data, its
+"""The live catalog: every project, the configs (tables) inside it, each config's
 background job — and the rules for who may touch them.
+
+The model
+---------
+  provider  ->  project (a schema)  ->  config (a table)
+
+A *project* is a named group of configs that belong together, the way tables belong to a
+schema. A config's `ref` fields can only point at configs of the same project, bulk
+operations (`replace`, `reset`, which also refresh dependents) can only reach tables of
+the same project, and a whole project exports as one schema (see /v1/projects/{id}/ddl
+and /export).
 
 Where things live
 -----------------
-  registry_configs (database)   the definition each provider published, plus `is_only_me`
-  Catalog.entries (memory)      the same, with the runtime config, Table object and owner
-  one physical table per config `d_<10 hex>_<name>` for provider configs, the plain entity
+  registry_projects (database)  each project, plus its `is_only_me`
+  registry_configs (database)   the definition each config was published with
+  Catalog.projects / .entries   the same in memory, with the runtime config and Table object
+  one physical table per config `d_<10 hex>_<name>` for API configs, the plain entity
                                 name for the built-in YAML examples
 
 Namespacing is what lets the existing engine (change feed, scheduler, batch, export)
-serve many providers unchanged: `change_log` and `scheduler_runs` already key on the
-entity name, and a provider's physical table names never collide with anyone else's. Each
-provider's configs also get their own `(configs, tables)` *scope*, so a `ref` field can
-only ever resolve to that provider's own rows, and bulk operations (`replace`, `reset`,
-which also refresh dependents) can only ever reach that provider's own tables.
+serve many projects unchanged: `change_log` and `scheduler_runs` already key on the
+entity name, and a config's physical table name never collides with anyone else's. Each
+project gets its own `(configs, tables)` *scope*.
+
+The built-in YAML examples form one read-only project, `examples`, owned by the system
+provider: its configs come from the files in `configs/`, so the API can't add to it,
+rename it or delete it (it can only be made private).
 
 Who may do what
 ---------------
-  read   the owner, the superuser, and — unless `is_only_me` is set — any other provider
+  read   the owner, the superuser, and — unless the project is `is_only_me` — any other provider
   write  the owner and the superuser only
-  A config marked `is_only_me` is invisible to everyone else: 404, not 403, so its
-  existence isn't revealed.
+  A project marked `is_only_me` is invisible to everyone else, and so are its configs:
+  404, not 403, so its existence isn't revealed. Visibility belongs to the project, never
+  to a single config, so a shared config can't point at a private parent.
 
 The catalog lives in one process's memory, like the scheduler and the write lock. Run
 a single instance (see the README's limitations).
@@ -39,7 +53,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import delete, select
 
 from ..config.entities import EntityConfig
-from ..config.provider import Limits, get_limits, normalize, physical_name, to_runtime, validate
+from ..config.provider import (
+    Limits, get_limits, normalize, physical_name, to_runtime, validate, validate_project,
+)
 from ..core.errors import ApiError
 from ..db import models
 from ..db.engine import engine
@@ -50,9 +66,10 @@ from .scheduler import WRITE_LOCK, schedule_entity, unschedule_entity
 
 logger = logging.getLogger("catalog")
 
-YAML_SCOPE = "yaml"  # the built-in examples share one scope: the legacy CONFIGS / TABLES
+# The built-in examples are the system project; its scope is the legacy CONFIGS / TABLES.
+SYSTEM_PROJECT_ID = registry.SYSTEM_PROJECT_ID
 PATCHABLE = frozenset(
-    {"is_only_me", "seed", "update_schedule", "failure_injection", "fields"})
+    {"seed", "update_schedule", "failure_injection", "fields"})
 LOCK_TIMEOUT = 30.0
 
 Scope = Tuple[Dict[str, EntityConfig], Dict[str, Any]]
@@ -70,13 +87,25 @@ def scrub(text: str, labels: Dict[str, str]) -> str:
 
 
 @dataclass
+class Project:
+    id: str
+    provider_id: str
+    name: str
+    description: Optional[str]
+    is_only_me: bool
+    source: str          # "api" | "yaml" (the built-in examples project)
+    created_at: Any
+    updated_at: Any
+
+
+@dataclass
 class Entry:
     id: str
     provider_id: str
+    project_id: str
     name: str            # the provider's own name for it
     physical: str        # the table it lives in
     source: str          # "api" | "yaml"
-    is_only_me: bool
     stored: EntityConfig  # as the provider wrote it (logical names)
     cfg: EntityConfig     # as the engine runs it (physical names)
     table: Any
@@ -88,6 +117,7 @@ class Catalog:
     def __init__(self) -> None:
         # guards the structures below and config create/edit/delete
         self.lock = threading.RLock()
+        self.projects: Dict[str, Project] = {}
         self.entries: Dict[str, Entry] = {}
         self.scopes: Dict[str, Scope] = {}
         self.scheduler: Any = None
@@ -95,44 +125,54 @@ class Catalog:
     # ------------------------------------------------------------ loading ----
     def load(self, system_configs: Dict[str, EntityConfig], system_tables: Dict[str, Any]) -> None:
         """Rebuild the catalog at startup: sync the YAML examples into the registry, then
-        load every provider config (building its Table object)."""
+        load every project and its configs (building each Table object)."""
         with self.lock:
+            self.projects.clear()
             self.entries.clear()
             self.scopes.clear()
             registry.ensure_system_provider()
-            self.scopes[YAML_SCOPE] = (system_configs, system_tables)
+            registry.ensure_system_project()
+            self.scopes[SYSTEM_PROJECT_ID] = (system_configs, system_tables)
 
             now = _now()
             registry.sync_yaml_rows([
                 {
-                    "id": f"cfg_sys_{name}", "provider_id": registry.SYSTEM_PROVIDER_ID, "name": name,
-                    "physical_name": name, "config_json": json.dumps(normalize(cfg)), "is_only_me": False,
-                    "source": "yaml", "created_at": now, "updated_at": now,
+                    "id": f"cfg_sys_{name}", "provider_id": registry.SYSTEM_PROVIDER_ID,
+                    "project_id": SYSTEM_PROJECT_ID, "name": name, "physical_name": name,
+                    "config_json": json.dumps(normalize(cfg)), "source": "yaml",
+                    "created_at": now, "updated_at": now,
                 }
                 for name, cfg in system_configs.items()
             ])
 
-            by_provider: Dict[str, List[Dict[str, Any]]] = {}
+            for prow in registry.list_project_rows():
+                self.projects[prow["id"]] = Project(**prow)
+
+            by_project: Dict[str, List[Dict[str, Any]]] = {}
             for row in registry.list_config_rows():
+                if row["project_id"] not in self.projects:
+                    logger.error("skipping config %s (%s): its project %s doesn't exist",
+                                 row["id"], row["name"], row["project_id"])
+                    continue
                 if row["source"] == "yaml":
                     cfg = system_configs.get(row["name"])
                     if cfg is not None:
                         self.entries[row["id"]] = self._entry(
                             row, cfg, cfg, system_tables[row["name"]])
                 else:
-                    by_provider.setdefault(row["provider_id"], []).append(row)
-            for provider_id, rows in by_provider.items():
-                self._load_provider(provider_id, rows)
+                    by_project.setdefault(row["project_id"], []).append(row)
+            for project_id, rows in by_project.items():
+                self._load_project(project_id, rows)
 
     @staticmethod
     def _entry(row: Dict[str, Any], stored: EntityConfig, cfg: EntityConfig, table: Any) -> Entry:
         return Entry(
-            id=row["id"], provider_id=row["provider_id"], name=row["name"], physical=row["physical_name"],
-            source=row["source"], is_only_me=bool(row["is_only_me"]), stored=stored, cfg=cfg, table=table,
+            id=row["id"], provider_id=row["provider_id"], project_id=row["project_id"], name=row["name"],
+            physical=row["physical_name"], source=row["source"], stored=stored, cfg=cfg, table=table,
             created_at=row["created_at"], updated_at=row["updated_at"],
         )
 
-    def _load_provider(self, provider_id: str, rows: List[Dict[str, Any]]) -> None:
+    def _load_project(self, project_id: str, rows: List[Dict[str, Any]]) -> None:
         limits = get_limits()
         stored: Dict[str, EntityConfig] = {}
         for row in rows:
@@ -144,7 +184,7 @@ class Catalog:
                     "skipping unreadable config %s (%s)", row["id"], row["name"])
         name_map = {r["name"]: r["physical_name"]
                     for r in rows if r["id"] in stored}
-        configs, tables = self._scope_dicts(provider_id)
+        configs, tables = self._scope_dicts(project_id)
         runtime: Dict[str, EntityConfig] = {}
         for row in rows:
             if row["id"] not in stored:
@@ -189,7 +229,7 @@ class Catalog:
     # ------------------------------------------------------------- scopes ----
     @staticmethod
     def scope_key(entry: Entry) -> str:
-        return entry.provider_id if entry.source == "api" else YAML_SCOPE
+        return entry.project_id
 
     def _scope_dicts(self, key: str) -> Scope:
         if key not in self.scopes:
@@ -199,16 +239,29 @@ class Catalog:
     def scope(self, entry: Entry) -> Scope:
         return self._scope_dicts(self.scope_key(entry))
 
+    def project_scope(self, project_id: str) -> Scope:
+        """The (configs, tables) dicts for one project: all the engine is ever handed."""
+        return self._scope_dicts(project_id)
+
+    def project_entries(self, project_id: str) -> List[Entry]:
+        """Every config in a project, in creation order."""
+        return [e for e in list(self.entries.values()) if e.project_id == project_id]
+
     def scope_entries(self, entry: Entry) -> List[Entry]:
-        key = self.scope_key(entry)
-        return [e for e in list(self.entries.values()) if self.scope_key(e) == key]
+        return self.project_entries(entry.project_id)
+
+    def project_of(self, entry: Entry) -> Project:
+        return self.projects[entry.project_id]
 
     def labels(self, entry: Entry) -> Dict[str, str]:
-        """{physical table name: the provider's name} for everything in this entry's scope."""
+        """{physical table name: the provider's name} for everything in this entry's project."""
         return {e.physical: e.name for e in self.scope_entries(entry)}
 
+    def project_labels(self, project_id: str) -> Dict[str, str]:
+        return {e.physical: e.name for e in self.project_entries(project_id)}
+
     def dependents(self, entry: Entry) -> List[Entry]:
-        """Configs (same owner) with a ref field pointing at this one."""
+        """Configs (same project) with a ref field pointing at this one."""
         return [
             e for e in self.scope_entries(entry)
             if e is not entry and any(f.type == "ref" and f.ref_entity == entry.name for f in e.stored.fields.values())
@@ -216,11 +269,18 @@ class Catalog:
 
     # ------------------------------------------------------------- access ----
     @staticmethod
-    def can_write(principal: Principal, entry: Entry) -> bool:
-        return principal.is_superuser or principal.provider_id == entry.provider_id
+    def can_write(principal: Principal, thing: Any) -> bool:
+        """`thing` is a Project or an Entry: both carry the owning provider's id."""
+        return principal.is_superuser or principal.provider_id == thing.provider_id
 
-    def can_read(self, principal: Principal, entry: Entry) -> bool:
-        return self.can_write(principal, entry) or not entry.is_only_me
+    def is_private(self, thing: Any) -> bool:
+        """Visibility is the project's: a config is private exactly when its project is."""
+        project = thing if isinstance(
+            thing, Project) else self.projects.get(thing.project_id)
+        return True if project is None else project.is_only_me
+
+    def can_read(self, principal: Principal, thing: Any) -> bool:
+        return self.can_write(principal, thing) or not self.is_private(thing)
 
     def resolve(self, config_id: str, principal: Principal, need: str = "read") -> Entry:
         """The entry, if `principal` may use it for `need` ("read" | "write")."""
@@ -235,29 +295,61 @@ class Catalog:
             )
         return entry
 
-    def visible(self, principal: Principal, scope: str = "all") -> List[Entry]:
-        """Everything `principal` may read. `mine` = their own; `shared` = other providers'
-        public configs. (For the superuser, "mine" means the built-in system-owned ones.)"""
+    def resolve_project(self, project_id: str, principal: Principal, need: str = "read") -> Project:
+        """The project, if `principal` may use it for `need`. A private project is a 404."""
+        project = self.projects.get(project_id)
+        if project is None or not self.can_read(principal, project):
+            raise ApiError(
+                "not_found", f"project '{project_id}' not found", 404)
+        if need == "write" and not self.can_write(principal, project):
+            raise ApiError(
+                "forbidden",
+                f"project '{project_id}' belongs to {project.provider_id}: you can read it, "
+                f"but only its owner can change it", 403)
+        return project
+
+    def _own(self, principal: Principal, thing: Any) -> bool:
+        return thing.provider_id == (
+            registry.SYSTEM_PROVIDER_ID if principal.is_superuser else principal.provider_id)
+
+    def visible(self, principal: Principal, scope: str = "all", project_id: Optional[str] = None) -> List[Entry]:
+        """Every config `principal` may read. `mine` = their own; `shared` = other providers'
+        public ones. (For the superuser, "mine" means the built-in system-owned ones.)
+        `project_id` narrows it to one project."""
         out = []
         for entry in list(self.entries.values()):
+            if project_id is not None and entry.project_id != project_id:
+                continue
             if not self.can_read(principal, entry):
                 continue
-            own = entry.provider_id == (
-                registry.SYSTEM_PROVIDER_ID if principal.is_superuser else principal.provider_id)
+            own = self._own(principal, entry)
             if (scope == "mine" and not own) or (scope == "shared" and own):
                 continue
             out.append(entry)
         return sorted(out, key=lambda e: (e.name, e.id))
 
+    def visible_projects(self, principal: Principal, scope: str = "all") -> List[Project]:
+        out = []
+        for project in list(self.projects.values()):
+            if not self.can_read(principal, project):
+                continue
+            own = self._own(principal, project)
+            if (scope == "mine" and not own) or (scope == "shared" and own):
+                continue
+            out.append(project)
+        return sorted(out, key=lambda p: (p.name, p.id))
+
     def describe(
         self, entry: Entry, principal: Principal, owners: Optional[Dict[str, str]] = None, detail: bool = False
     ) -> Dict[str, Any]:
         owners = owners if owners is not None else registry.provider_names()
+        project = self.projects.get(entry.project_id)
         out: Dict[str, Any] = {
             "id": entry.id,
             "name": entry.name,
+            "project": {"id": entry.project_id, "name": project.name if project else None,
+                        "is_only_me": bool(project and project.is_only_me)},
             "owner": {"id": entry.provider_id, "full_name": owners.get(entry.provider_id)},
-            "is_only_me": entry.is_only_me,
             "source": entry.source,
             "can_write": self.can_write(principal, entry),
             "cadence": entry.stored.update_schedule.cadence,
@@ -269,41 +361,150 @@ class Catalog:
             out["config"] = normalize(entry.stored)
         return out
 
-    # ------------------------------------------------------------- create ----
-    def create(self, owner_id: str, raw: Any, limits: Limits) -> Tuple[Entry, int]:
-        """Validate a provider's config, create its table, seed it and schedule its job.
-        Returns (entry, rows seeded). Everything is undone if any step fails."""
+    def describe_project(
+        self, project: Project, principal: Principal, owners: Optional[Dict[str, str]] = None, detail: bool = False
+    ) -> Dict[str, Any]:
+        owners = owners if owners is not None else registry.provider_names()
+        members = self.project_entries(project.id)
+        out: Dict[str, Any] = {
+            "id": project.id,
+            "name": project.name,
+            "description": project.description,
+            "owner": {"id": project.provider_id, "full_name": owners.get(project.provider_id)},
+            "is_only_me": project.is_only_me,
+            "source": project.source,
+            "can_write": self.can_write(principal, project),
+            "config_count": len(members),
+            "created_at": project.created_at.isoformat() if project.created_at else None,
+            "updated_at": project.updated_at.isoformat() if project.updated_at else None,
+        }
+        if detail:
+            out["configs"] = [{"id": e.id, "name": e.name, "cadence": e.stored.update_schedule.cadence}
+                              for e in sorted(members, key=lambda e: (e.name, e.id))]
+        return out
+
+    # ----------------------------------------------------------- projects ----
+    def create_project(self, owner_id: str, raw: Any, limits: Limits) -> Project:
+        """Create an empty project (a schema with no tables yet) for `owner_id`."""
         with self.lock:
             if registry.get_provider(owner_id) is None:
                 raise ApiError(
                     "not_found", f"provider '{owner_id}' not found", 404)
-            owned = [e for e in list(self.entries.values())
-                     if e.provider_id == owner_id]
-            api_owned = [e for e in owned if e.source == "api"]
+            values = validate_project(raw)
+            mine = [p for p in self.projects.values()
+                    if p.provider_id == owner_id and p.source == "api"]
+            if len(mine) >= limits.max_projects:
+                raise ApiError(
+                    "quota_exceeded",
+                    f"a provider can hold at most {limits.max_projects} projects; delete one first", 409)
+            if values["name"] in {p.name for p in self.projects.values() if p.provider_id == owner_id}:
+                raise ApiError("already_exists",
+                               f"you already have a project named '{values['name']}'", 409)
+            now = _now()
+            row = {"id": registry.new_id("prj"), "provider_id": owner_id, "name": values["name"],
+                   "description": values.get("description"),
+                   "is_only_me": bool(values.get("is_only_me", False)), "source": "api",
+                   "created_at": now, "updated_at": now}
+            registry.insert_project_row(row)
+            project = Project(**row)
+            self.projects[project.id] = project
+            self._scope_dicts(project.id)
+            return project
+
+    def update_project(self, project: Project, patch: Any) -> Project:
+        """Rename a project, change its description, or share / unshare it."""
+        with self.lock:
+            values = validate_project(patch, patch=True)
+            if project.source == "yaml" and set(values) - {"is_only_me"}:
+                raise ApiError(
+                    "managed_by_yaml",
+                    "the built-in examples project is defined by the files in configs/ "
+                    "(only is_only_me can be changed here)", 409)
+            if "name" in values and values["name"] != project.name:
+                clash = [p for p in self.projects.values()
+                         if p.provider_id == project.provider_id and p.id != project.id
+                         and p.name == values["name"]]
+                if clash:
+                    raise ApiError("already_exists",
+                                   f"you already have a project named '{values['name']}'", 409)
+            registry.update_project_row(project.id, **values)
+            for key, value in values.items():
+                setattr(project, key, value)
+            project.updated_at = _now()
+            return project
+
+    def delete_project(self, project: Project) -> int:
+        """Delete a project, every config in it and ALL their data. Returns how many configs went."""
+        with self.lock:
+            if project.source == "yaml":
+                raise ApiError(
+                    "managed_by_yaml",
+                    "the built-in examples project comes from the files in configs/ and can't be deleted "
+                    "through the API", 409)
+            removed = 0
+            # children before parents, so no config is ever deleted while another still refs it
+            while True:
+                remaining = self.project_entries(project.id)
+                if not remaining:
+                    break
+                leaf = next(
+                    (e for e in remaining if not self.dependents(e)), None)
+                # unreachable (refs form a DAG); never loop forever
+                if leaf is None:
+                    raise ApiError(
+                        "conflict", "can't order this project's configs for deletion", 409)
+                self.delete(leaf)
+                removed += 1
+            registry.delete_project_row(project.id)
+            self.projects.pop(project.id, None)
+            self.scopes.pop(project.id, None)
+            return removed
+
+    # ------------------------------------------------------------- create ----
+    def create(self, project: Project, raw: Any, limits: Limits) -> Tuple[Entry, int]:
+        """Validate a config, create its table inside `project`, seed it and schedule its job.
+        Returns (entry, rows seeded). Everything is undone if any step fails."""
+        with self.lock:
+            if project.source == "yaml":
+                raise ApiError(
+                    "managed_by_yaml",
+                    "the built-in examples project is defined by the files in configs/: "
+                    "create your own project to publish configs", 409)
+            if project.id not in self.projects:
+                raise ApiError(
+                    "not_found", f"project '{project.id}' not found", 404)
+            owner_id = project.provider_id
+            members = self.project_entries(project.id)
+            if len(members) >= limits.max_configs_per_project:
+                raise ApiError(
+                    "quota_exceeded",
+                    f"a project can hold at most {limits.max_configs_per_project} configs; delete one first", 409)
+            api_owned = [e for e in list(self.entries.values())
+                         if e.provider_id == owner_id and e.source == "api"]
             if len(api_owned) >= limits.max_configs:
                 raise ApiError(
                     "quota_exceeded",
-                    f"a provider can hold at most {limits.max_configs} configs; delete one first", 409,
+                    f"a provider can hold at most {limits.max_configs} configs across all its projects; "
+                    f"delete one first", 409,
                 )
-            stored, flag = validate(
-                raw, {e.name: e.stored for e in api_owned}, limits)
-            if stored.entity in {e.name for e in owned}:
+            stored = validate(raw, {e.name: e.stored for e in members}, limits)
+            if stored.entity in {e.name for e in members}:
                 raise ApiError(
-                    "already_exists", f"you already have a config named '{stored.entity}'", 409)
+                    "already_exists",
+                    f"project '{project.name}' already has a config named '{stored.entity}'", 409)
 
-            # shared for reading unless the provider says otherwise
-            only_me = bool(flag)
             config_id, physical = self._new_ids(stored.entity)
-            configs, tables = self._scope_dicts(owner_id)
-            name_map = {e.name: e.physical for e in api_owned}
+            configs, tables = self._scope_dicts(project.id)
+            name_map = {e.name: e.physical for e in members}
             name_map[stored.entity] = physical
             labels = {v: k for k, v in name_map.items()}
             runtime = to_runtime(stored, physical, name_map, limits.max_rows)
 
             now = _now()
             registry.insert_config_row({
-                "id": config_id, "provider_id": owner_id, "name": stored.entity, "physical_name": physical,
-                "config_json": json.dumps(normalize(stored)), "is_only_me": only_me, "source": "api",
+                "id": config_id, "provider_id": owner_id, "project_id": project.id,
+                "name": stored.entity, "physical_name": physical,
+                "config_json": json.dumps(normalize(stored)), "source": "api",
                 "created_at": now, "updated_at": now,
             })
             table = None
@@ -322,8 +523,9 @@ class Catalog:
                 raise
 
             entry = Entry(
-                id=config_id, provider_id=owner_id, name=stored.entity, physical=physical, source="api",
-                is_only_me=only_me, stored=stored, cfg=runtime, table=table, created_at=now, updated_at=now,
+                id=config_id, provider_id=owner_id, project_id=project.id, name=stored.entity,
+                physical=physical, source="api", stored=stored, cfg=runtime, table=table,
+                created_at=now, updated_at=now,
             )
             self.entries[config_id] = entry
             if self.scheduler is not None:
@@ -382,24 +584,17 @@ class Catalog:
                     "invalid_request", f"send at least one of: {sorted(PATCHABLE)}", 422)
             unknown = sorted(set(patch) - PATCHABLE)
             if unknown:
+                hint = (" is_only_me belongs to the project: PATCH /v1/projects/{project_id}."
+                        if "is_only_me" in unknown else "")
                 raise ApiError(
-                    "invalid_request", f"can't change {unknown}. Editable: {sorted(PATCHABLE)} (a name can't be changed)", 422)
-            if "is_only_me" in patch and not isinstance(patch["is_only_me"], bool):
-                raise ApiError("invalid_request",
-                               "is_only_me must be true or false", 422)
-            only_me = patch.get("is_only_me", entry.is_only_me)
-
-            definition = set(patch) - {"is_only_me"}
-            if entry.source == "yaml" and definition:
+                    "invalid_request",
+                    f"can't change {unknown}. Editable: {sorted(PATCHABLE)} (a name can't be changed).{hint}", 422)
+            if entry.source == "yaml":
                 raise ApiError(
                     "managed_by_yaml",
-                    "this built-in config is defined by a YAML file: edit the file and restart (only is_only_me can be changed here)",
+                    "this built-in config is defined by a YAML file: edit the file and restart",
                     409,
                 )
-            if not definition:
-                registry.update_config_row(entry.id, is_only_me=only_me)
-                entry.is_only_me, entry.updated_at = only_me, _now()
-                return entry, None
 
             candidate = normalize(entry.stored)
             for key in ("seed", "update_schedule", "failure_injection"):
@@ -412,8 +607,8 @@ class Catalog:
                 candidate["fields"] = patch["fields"]
             others = {e.name: e.stored for e in self.scope_entries(
                 entry) if e is not entry}
-            stored, _ = validate(candidate, others, limits,
-                                 forced_name=entry.name)
+            stored = validate(candidate, others, limits,
+                              forced_name=entry.name)
 
             configs, tables = self.scope(entry)
             name_map = {e.name: e.physical for e in self.scope_entries(entry)}
@@ -422,19 +617,19 @@ class Catalog:
 
             if normalize(stored)["fields"] != normalize(entry.stored)["fields"]:
                 seeded = self._replace_fields(
-                    entry, stored, runtime, only_me, confirm, configs, tables)
+                    entry, stored, runtime, confirm, configs, tables)
                 return entry, seeded
 
             registry.update_config_row(entry.id, config_json=json.dumps(
-                normalize(stored)), is_only_me=only_me)
-            entry.stored, entry.cfg, entry.is_only_me, entry.updated_at = stored, runtime, only_me, _now()
+                normalize(stored)))
+            entry.stored, entry.cfg, entry.updated_at = stored, runtime, _now()
             configs[entry.physical] = runtime
             if self.scheduler is not None:
                 schedule_entity(self.scheduler, engine,
                                 entry.physical, tables, configs)
             return entry, None
 
-    def _replace_fields(self, entry: Entry, stored: EntityConfig, runtime: EntityConfig, only_me: bool,
+    def _replace_fields(self, entry: Entry, stored: EntityConfig, runtime: EntityConfig,
                         confirm: bool, configs: Dict[str, EntityConfig], tables: Dict[str, Any]) -> int:
         if not confirm:
             raise ApiError(
@@ -489,8 +684,8 @@ class Catalog:
             WRITE_LOCK.release()
 
         registry.update_config_row(entry.id, config_json=json.dumps(
-            normalize(stored)), is_only_me=only_me)
-        entry.stored, entry.cfg, entry.table, entry.is_only_me, entry.updated_at = stored, runtime, new_table, only_me, _now()
+            normalize(stored)))
+        entry.stored, entry.cfg, entry.table, entry.updated_at = stored, runtime, new_table, _now()
         if self.scheduler is not None:
             schedule_entity(self.scheduler, engine,
                             entry.physical, tables, configs)

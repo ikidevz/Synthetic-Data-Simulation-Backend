@@ -2,7 +2,7 @@
 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-310%20passing-brightgreen.svg)](#run-the-tests)
+[![Tests](https://img.shields.io/badge/tests-355%20passing-brightgreen.svg)](#run-the-tests)
 [![License](https://img.shields.io/badge/license-see%20repo-lightgrey.svg)](#)
 
 A FastAPI backend that serves **purely synthetic, config-driven data** and **mutates it on its own schedule** (hourly / daily / weekly) — a self-contained “living source system” for building and stress-testing data ingestion pipelines.
@@ -13,8 +13,9 @@ A FastAPI backend that serves **purely synthetic, config-driven data** and **mut
 
 ## Features
 
-- **Config-driven** — an entity is a YAML file, or a `POST /v1/configs`. Adding one needs zero Python changes.
-- **Multi-provider** — providers publish their own configs through the API, authenticated by their own API key. Each config’s data is readable by other providers unless the owner marks it `is_only_me`; only the owner can write. A **superuser** key can do everything.
+- **Config-driven** — an entity is a YAML file, or a `POST` to a project. Adding one needs zero Python changes.
+- **Projects = schemas** — `provider → project → config → row`. A **project** is a named group of configs, like a schema is a group of tables; a **config** is one table. `ref` fields resolve only inside the project, `replace`/`reset`/batch refresh only that project's tables, and the **whole project** exports as one schema (`GET /v1/projects/{id}/ddl` and `/export`; on PostgreSQL it starts with `CREATE SCHEMA` + `SET search_path`). Visibility (`is_only_me`) belongs to the project, so a shared table can never point at a hidden parent.
+- **Multi-provider** — providers create projects and publish configs through the API, authenticated by their own API key. A project (and the configs in it) is readable by other providers unless the owner marks it `is_only_me`; only the owner can write. A **superuser** key can do everything.
 - **Living data** — a background scheduler inserts, updates, and soft-deletes rows on each entity’s cadence.
 - **Ingestion-ready** — every entity exposes a `/changes?since=<version>` feed (insert / update / delete), the same contract a real incremental source provides.
 - **Batch generation + one-call refresh** — bulk-generate rows in chunks, or wipe and regenerate the whole dataset — reproducibly, with a seed.
@@ -36,7 +37,7 @@ A FastAPI backend that serves **purely synthetic, config-driven data** and **mut
 - [Configuring entities](#configuring-entities)
 - [API (built-in entities)](#api-built-in-entities)
 - [Authentication](#authentication)
-- [Providers & publishing configs (`/v1`)](#providers--publishing-configs-v1)
+- [Providers, projects & publishing configs (`/v1`)](#providers-projects--publishing-configs-v1)
 - [Batch generation, DDL & refresh](#batch-generation-ddl-export--refresh)
 - [Project structure](#project-structure)
 - [Design notes](#design-notes)
@@ -89,11 +90,13 @@ The CLI works on the **built-in YAML entities**. Provider-published configs are 
 pytest -v
 ```
 
-310 tests. Default target is SQLite. Point `TEST_DATABASE_URL` at an **empty** PostgreSQL database to run the same suite there (its `public` schema is wiped first):
+355 tests. Default target is SQLite. Point `TEST_DATABASE_URL` at an **empty** PostgreSQL database to run the same suite there (its `public` schema is wiped first):
 
 ```bash
 TEST_DATABASE_URL=postgresql+psycopg2://synthetic:synthetic@localhost:5433/synthetic_test pytest -v
 ```
+
+**The tests never read `configs/*.yaml`** — those files are examples for people, not fixtures. The built-in entities the legacy-route tests need come from `tests/entity_fixtures.py` (written to a temp directory that `CONFIG_DIR` points at before the app starts), and every other test builds its configs inline. You can edit or delete the examples without touching a test.
 
 ---
 
@@ -112,7 +115,7 @@ docker compose up --build
 
 ## Configuring entities
 
-Three example entities ship in `configs/`:
+Three **example** entities ship in `configs/`. They are what the server seeds on a fresh start, and a handy body to post into your own project (`--data-binary @configs/customers.yaml`). They appear through `/v1` as one read-only project called `examples`.
 
 | Entity            | Notes                                                                                                 |
 | ----------------- | ----------------------------------------------------------------------------------------------------- |
@@ -120,7 +123,7 @@ Three example entities ship in `configs/`:
 | `orders`          | References `customers`                                                                                |
 | `support_tickets` | References `orders` (3-level chain); daily cadence; `int` / `bool` fields; non-zero failure injection |
 
-Each file in `configs/` defines one entity:
+Each file in `configs/` (and each body you post to a project) defines one entity — one table:
 
 ```yaml
 entity: orders
@@ -164,7 +167,7 @@ Every entity needs exactly one `primary_key: true` field. Invalid configs (unkno
 
 ## API (built-in entities)
 
-These routes serve the **built-in YAML entities** and need a **superuser** key. A provider key gets `403`; providers use [`/v1`](#providers--publishing-configs-v1).
+These routes serve the **built-in YAML entities** and need a **superuser** key. A provider key gets `403`; providers use [`/v1`](#providers-projects--publishing-configs-v1).
 
 ### Per entity (`/orders` shown)
 
@@ -228,7 +231,7 @@ Every failure — 401, 404, 422, injected 500 — uses the same envelope:
 | Key                                    | Who                               | Capabilities                                                                                              |
 | -------------------------------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | **Superuser** (`API_KEY` / `API_KEYS`) | Operator                          | Everything: all providers’ configs and data (including private), create providers/keys, all legacy routes |
-| **Provider** (issued by superuser)     | One provider (`id` + `full_name`) | `/v1` only: publish configs, read public configs, read/write own                                          |
+| **Provider** (issued by superuser)     | One provider (`id` + `full_name`) | `/v1` only: create projects, publish configs, read public projects, read/write own                        |
 
 ```bash
 python -m app.cli genkey
@@ -254,9 +257,13 @@ curl -H 'X-API-Key: <the key>' localhost:8000/metrics
 
 ---
 
-## Providers & publishing configs (`/v1`)
+## Providers, projects & publishing configs (`/v1`)
 
-A **provider** publishes configs and owns them. Providers are created by the superuser (no open sign-up). Each authenticates with its own API key.
+```
+provider  →  project (a schema)  →  config (a table)  →  rows
+```
+
+A **provider** owns **projects**; a project holds the **configs** (tables) that belong together. Providers are created by the superuser (no open sign-up) and each authenticates with its own API key.
 
 ```bash
 SU=<your superuser key>
@@ -269,83 +276,132 @@ curl -X POST localhost:8000/v1/admin/providers \
 
 KEY=<that api_key>
 
-# 2. Publish a config (JSON or YAML)
-curl -X POST localhost:8000/v1/configs \
-  -H "X-API-Key: $KEY" -H 'Content-Type: text/yaml' \
-  --data-binary @configs/customers.yaml
-# → { "id": "cfg_…", "name": "customers", "seeded_rows": 30, … }
+# 2. Create a project — the schema your tables will live in (name is unique per provider)
+curl -X POST "localhost:8000/v1/projects?on_exists=reuse" \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"name": "acme", "description": "Acme demo domain"}'
+# → { "id": "prj_…", "name": "acme", "config_count": 0, "created": true, … }
+#   (run it again: 200, "created": false, the same id — nothing changes)
+PRJ=<that id>
 
-# 3. Read data and the change feed
+# 3. Publish configs (tables) into it — parents first (JSON or YAML)
+for f in customers orders support_tickets; do
+  curl -X POST "localhost:8000/v1/projects/$PRJ/configs" \
+    -H "X-API-Key: $KEY" -H 'Content-Type: text/yaml' \
+    --data-binary @configs/$f.yaml
+done
+# → { "id": "cfg_…", "name": "customers", "project": {"id": "prj_…", "name": "acme", …}, "seeded_rows": 30, … }
+
+# 4. Read data and the change feed (by config id)
 curl -H "X-API-Key: $KEY" "localhost:8000/v1/configs/cfg_…/data?limit=5"
 curl -H "X-API-Key: $KEY" "localhost:8000/v1/configs/cfg_…/changes?since=0"
+
+# 5. …or act on the whole project as one unit
+curl -H "X-API-Key: $KEY" "localhost:8000/v1/projects/$PRJ"                  # its configs
+curl -X POST "localhost:8000/v1/projects/$PRJ/batch" \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"mode":"replace","confirm":true,"seed":1}'                            # refresh every table
+curl -H "X-API-Key: $KEY" "localhost:8000/v1/projects/$PRJ/ddl?dialect=postgresql"   # the whole schema
+curl -H "X-API-Key: $KEY" -o acme.zip "localhost:8000/v1/projects/$PRJ/export?format=sql"
 ```
 
-Add `is_only_me: true` to keep a config private (default `false`: other providers may **read**, never change).
+### What a project is (and isn't)
+
+| Rule | Behaviour |
+| --- | --- |
+| **Scope of `ref`** | A `ref` field can only point at a config in the **same project** — not another provider's, and not even your own other project's |
+| **Scope of refresh** | `replace` / `reset` (which also refresh dependents) and a project batch only reach that project's tables |
+| **Names** | A config name is unique **per project** (two projects can both have `orders`); a project name is unique **per provider** |
+| **Visibility** | `is_only_me` is a **project** setting and every config inherits it. There is no per-config switch (`is_only_me` in a config body is rejected) |
+| **Schema export** | `GET /v1/projects/{id}/ddl` is every table, parents first. On `dialect=postgresql` it opens with `CREATE SCHEMA IF NOT EXISTS <project>` and `SET search_path` |
+| **Zip export** | `GET /v1/projects/{id}/export` — `schema.sql`, one file per config (parents first) and a `manifest.json` that names the project |
+| **Names in SQL** | A project name is a plain lowercase identifier (`^[a-z][a-z0-9_]{0,31}$`), so it is safe as a schema name |
+| **Table names** | Unchanged: each config is still stored as `d_<10 hex>_<name>`; a project never renames a table and never changes the change feed |
+| **Built-in examples** | The `configs/*.yaml` entities form one read-only project, `examples` (`prj_system_examples`): you can read it; only the superuser can write to its tables; nobody can add to, rename or delete it through the API |
+
+Add `is_only_me: true` to a project to hide it **and every config inside it** (default `false`: other providers may **read**, never change).
 
 ### Who can do what
 
-| Action                                           | Owner | Other provider                | Superuser |
-| ------------------------------------------------ | :---: | ----------------------------- | :-------: |
-| Read config, rows, changes, export, DDL, metrics |  yes  | yes — **unless `is_only_me`** |    yes    |
-| Edit/delete config; write rows; batch; simulate  |  yes  | **no** (`403`)                |    yes    |
-| Config with `is_only_me: true`                   | full  | **`404`** (as if missing)     |   full    |
+| Action                                                              | Owner | Other provider                | Superuser |
+| ------------------------------------------------------------------- | :---: | ----------------------------- | :-------: |
+| Read project, its configs, rows, changes, export, DDL, metrics      |  yes  | yes — **unless `is_only_me`** |    yes    |
+| Edit/delete project or config; publish configs; write rows; batch; simulate |  yes  | **no** (`403`)                |    yes    |
+| Project (or config in it) with `is_only_me: true`                   | full  | **`404`** (as if missing)     |   full    |
 
-Private configs return `404`, not `403`, so existence is not revealed. Built-in YAML examples are owned by a system provider: public to read, writable only by the superuser.
+A private project returns `404`, not `403`, so its existence is not revealed. Built-in YAML examples are owned by a system provider: public to read, writable only by the superuser.
 
 ### `/v1` routes
 
-| Method                 | Path                                       | Purpose                                              |
-| ---------------------- | ------------------------------------------ | ---------------------------------------------------- |
-| `GET`                  | `/v1/me`                                   | Who this key is + quotas                             |
+| Method                 | Path                                       | Purpose                                                |
+| ---------------------- | ------------------------------------------ | ------------------------------------------------------ |
+| `GET`                  | `/v1/me`                                   | Who this key is + quotas + how many projects/configs you own |
 | `POST` `GET`           | `/v1/admin/providers`                      | **SU:** create provider (key once; unique name) / list |
-| `PATCH`                | `/v1/admin/providers/{id}`                 | **SU:** rename or deactivate                         |
-| `POST` `DELETE`        | `/v1/admin/providers/{id}/keys[/{key_id}]` | **SU:** issue / revoke keys                          |
-| `POST`                 | `/v1/configs`                              | Publish (JSON or YAML); SU may use `?provider_id=`   |
-| `POST`                 | `/v1/configs/validate`                     | Dry-run validation                                   |
-| `GET`                  | `/v1/configs?scope=mine\|shared\|all`      | List readable configs                                |
-| `GET` `PATCH` `DELETE` | `/v1/configs/{id}`                         | Definition / edit / delete (`?confirm=true`)         |
-| `GET` `POST`           | `/v1/configs/{id}/data`                    | List (keyset: `next_after` → `after`) / create row   |
-| `GET` `PUT` `DELETE`   | `/v1/configs/{id}/data/{row_id}`           | One row / update / soft-delete                       |
-| `GET`                  | `/v1/configs/{id}/changes?since=`          | Change feed                                          |
-| `GET`                  | `/v1/configs/{id}/export`                  | Snapshot or `?since=` delta (`csv`, `ndjson`, `sql`) |
-| `GET`                  | `/v1/configs/{id}/ddl`                     | `CREATE TABLE` / `INDEX`                             |
-| `GET`                  | `/v1/configs/{id}/metrics` · `/runs`       | Row count / job runs                                 |
-| `POST`                 | `/v1/configs/{id}/batch`                   | `append` / `replace` / `reset`                       |
-| `POST`                 | `/v1/configs/{id}/simulate`                | On-demand inserts, updates, deletes                  |
-| `GET`                  | `/v1/export?configs=a,b`                   | Zip: schema + data + manifest                        |
+| `PATCH`                | `/v1/admin/providers/{id}`                 | **SU:** rename or deactivate                           |
+| `POST` `DELETE`        | `/v1/admin/providers/{id}/keys[/{key_id}]` | **SU:** issue / revoke keys                            |
+| `POST`                 | `/v1/projects`                             | Create a project; `?on_exists=reuse` for a safe retry; SU may use `?provider_id=` |
+| `GET`                  | `/v1/projects?scope=mine\|shared\|all`     | List readable projects                                 |
+| `GET` `PATCH` `DELETE` | `/v1/projects/{id}`                        | Detail (with its configs) / rename, describe, share / delete project **and all its configs** (`?confirm=true`) |
+| `GET`                  | `/v1/projects/{id}/ddl`                    | The whole schema (`CREATE SCHEMA` on PostgreSQL)       |
+| `GET`                  | `/v1/projects/{id}/export`                 | Zip of every table: schema + data + manifest           |
+| `POST`                 | `/v1/projects/{id}/batch`                  | `append` / `replace` / `reset` for every config in it  |
+| `POST`                 | `/v1/projects/{id}/configs`                | Publish a config (JSON or YAML) into the project       |
+| `POST`                 | `/v1/projects/{id}/configs/validate`       | Dry-run validation                                     |
+| `GET`                  | `/v1/projects/{id}/configs`                | The project's configs                                  |
+| `GET`                  | `/v1/configs?scope=…&project_id=`          | List readable configs (optionally one project)         |
+| `GET` `PATCH` `DELETE` | `/v1/configs/{id}`                         | Definition / edit / delete (`?confirm=true`)           |
+| `GET` `POST`           | `/v1/configs/{id}/data`                    | List (keyset: `next_after` → `after`) / create row     |
+| `GET` `PUT` `DELETE`   | `/v1/configs/{id}/data/{row_id}`           | One row / update / soft-delete                         |
+| `GET`                  | `/v1/configs/{id}/changes?since=`          | Change feed                                            |
+| `GET`                  | `/v1/configs/{id}/export`                  | Snapshot or `?since=` delta (`csv`, `ndjson`, `sql`)   |
+| `GET`                  | `/v1/configs/{id}/ddl`                     | `CREATE TABLE` / `INDEX`                               |
+| `GET`                  | `/v1/configs/{id}/metrics` · `/runs`       | Row count / job runs                                   |
+| `POST`                 | `/v1/configs/{id}/batch`                   | `append` / `replace` / `reset` for one config (+ dependents) |
+| `POST`                 | `/v1/configs/{id}/simulate`                | On-demand inserts, updates, deletes                    |
+| `GET`                  | `/v1/export?configs=a,b`                   | Zip of chosen configs — all from one project           |
+
+> **Breaking change:** `POST /v1/configs` and `POST /v1/configs/validate` no longer exist — a config is always published *into a project*. Everything addressed by config id (`/v1/configs/{id}/…`) is unchanged.
 
 ### Config rules (API-published)
 
-- **Names:** `^[a-z][a-z0-9_]{0,31}$` (`schema` and `manifest` reserved); field names up to 40 chars. Unique per provider.
-- **Unknown keys rejected** (typos fail loudly).
+- **Names:** `^[a-z][a-z0-9_]{0,31}$` (`schema` and `manifest` reserved); field names up to 40 chars. Unique per project.
+- **Unknown keys rejected** (typos fail loudly) — including `is_only_me`, which is a project setting.
 - **`version` auto-added** if omitted; must be `type: int, auto: version` if declared.
 - **Exactly one primary key**, `type: uuid`.
-- **`ref` only within your own configs**; no self-reference or cycles.
+- **`ref` only within the same project**; no self-reference or cycles.
 - **Trial generation** before save (bad `key_label` fails at publish time).
 - **YAML anchors/aliases rejected**.
 
 ### Quotas (env vars)
 
-| Variable                   | Default | Limits                                            |
-| -------------------------- | ------- | ------------------------------------------------- |
-| `MAX_CONFIGS_PER_PROVIDER` | `10`    | Configs per provider                              |
-| `MAX_FIELDS_PER_CONFIG`    | `40`    | Fields per config                                 |
-| `MAX_INITIAL_COUNT`        | `10000` | `seed.initial_count`                              |
-| `MAX_ROWS_PER_CONFIG`      | `50000` | Total rows (batch, simulate, scheduler stop here) |
-| `MAX_LATENCY_MS`           | `5000`  | `failure_injection.latency_ms`                    |
-| `MAX_CONFIG_BYTES`         | `65536` | Config body size                                  |
+| Variable                     | Default | Limits                                            |
+| ---------------------------- | ------- | ------------------------------------------------- |
+| `MAX_PROJECTS_PER_PROVIDER`  | `3`     | Projects per provider                             |
+| `MAX_CONFIGS_PER_PROJECT`    | `10`    | Configs (tables) in one project                   |
+| `MAX_CONFIGS_PER_PROVIDER`   | `10`    | Configs across **all** of a provider's projects (the storage ceiling) |
+| `MAX_FIELDS_PER_CONFIG`      | `40`    | Fields per config                                 |
+| `MAX_INITIAL_COUNT`          | `10000` | `seed.initial_count`                              |
+| `MAX_ROWS_PER_CONFIG`        | `50000` | Total rows (batch, simulate, scheduler stop here) |
+| `MAX_LATENCY_MS`             | `5000`  | `failure_injection.latency_ms`                    |
+| `MAX_CONFIG_BYTES`           | `65536` | Config/project body size                          |
 
 ### Editing and deleting
 
-- `PATCH` merges `seed` / `update_schedule` / `failure_injection`; toggles `is_only_me`; takes effect immediately.
+- **Project `PATCH`:** rename, change `description`, or flip `is_only_me` — takes effect immediately and never touches data.
+- **Project `DELETE`** (`?confirm=true`): deletes every config in it and all their data, children first, and frees every quota slot it held.
+- **Config `PATCH`** merges `seed` / `update_schedule` / `failure_injection` and takes effect immediately.
 - Changing **`fields`** drops data, restarts the feed, re-seeds — needs `?confirm=true`; blocked if dependents exist.
-- **Name cannot change** — delete and recreate.
-- `DELETE` drops table + history + job; blocked if dependents exist.
-- Built-in YAML configs: only `is_only_me` can be toggled (by superuser); otherwise `409 managed_by_yaml`.
+- **A config's name cannot change** — delete and recreate.
+- Config `DELETE` drops table + history + job; blocked if dependents exist.
+- Built-in YAML configs and the `examples` project: only the project's `is_only_me` can be toggled (by the superuser); anything else is `409 managed_by_yaml`.
+
+### Upgrading an existing database
+
+On startup the app migrates a pre-projects database in place (idempotent, no data moves): each provider that already has configs gets one project called `default` holding them, and the built-in examples go to `examples`. **Privacy is never loosened** — if *any* of a provider's configs was private, its whole `default` project becomes private; re-share it with `PATCH /v1/projects/{id}`. The migration was exercised on SQLite; run it against a copy of your PostgreSQL database first.
 
 ### How isolation works
 
-Each published config gets a table named `d_<10 hex>_<name>`. Two providers’ `orders` never share a table. `ref` fields resolve only within a provider’s own scope. API responses, DDL, exports, manifests and error messages always use the logical names the provider chose — never the internal table names.
+Each published config gets a table named `d_<10 hex>_<name>`. Two projects' `orders` never share a table. `ref` fields resolve only within the project, and every bulk operation is handed only that project's tables. API responses, DDL, exports, manifests and error messages always use the logical names the provider chose — never the internal table names.
 
 ---
 
@@ -360,7 +416,7 @@ curl -X POST localhost:8000/admin/batch -H 'Content-Type: application/json' \
 
 # Bulk-add 50,000 orders in chunks of 5,000
 curl -X POST localhost:8000/admin/batch -H 'Content-Type: application/json' \
-  -d '{"entities":["orders"],"count":50000,"batch_size":5000}'
+  -d '{"entities":["orders_sample"],"count":50000,"batch_size":5000}'
 ```
 
 | Field              | Meaning                                                    |
@@ -398,7 +454,7 @@ curl 'localhost:8000/ddl?include_system=true'   # also change_log + scheduler_ru
 
 ```bash
 curl -X POST localhost:8000/admin/changes -H 'Content-Type: application/json' \
-  -d '{"entities":["orders"],"inserts":100,"updates":500,"deletes":20,"seed":1}'
+  -d '{"entities":["orders_sample"],"inserts":100,"updates":500,"deletes":20,"seed":1}'
 ```
 
 Omit counts → one default scheduler tick. Counts larger than available live rows are clamped and explained under `notes`.
@@ -426,7 +482,8 @@ curl -o export.zip 'localhost:8000/export?format=sql'         # full bundle
 
 ```
 synthetic-backend/
-├── configs/                 # one YAML file per built-in entity
+├── configs/                 # EXAMPLE entities (one YAML file each) — not used by the tests
+├── PROJECTS.md              # the projects (schema) model, routes, migration
 ├── app/
 │   ├── main.py              # ASGI entrypoint, lifespan, seeding, legacy routes
 │   ├── cli.py               # genkey | create-provider | ddl | batch | changes | export
@@ -437,24 +494,24 @@ synthetic-backend/
 │   │   └── provider.py      # HTTP config validation + quotas
 │   ├── db/
 │   │   ├── engine.py        # engine (SQLite default; DATABASE_URL override)
-│   │   └── models.py        # dynamic Core tables + change_log + registry
+│   │   └── models.py        # dynamic Core tables + change_log + registry (providers, keys, projects, configs)
 │   ├── security/
 │   │   └── api_keys.py      # global API-key auth, Principal
 │   ├── api/
 │   │   ├── error_handlers.py
-│   │   └── v1/routes.py     # /v1 providers, configs, data, export
+│   │   └── v1/routes.py     # /v1 providers, projects, configs, data, export
 │   └── services/
-│       ├── catalog.py       # provisioning, scheduler jobs, access rules
-│       ├── registry.py      # providers, hashed keys, config rows
+│       ├── catalog.py       # projects, provisioning, scheduler jobs, access rules
+│       ├── registry.py      # providers, hashed keys, project + config rows, migration
 │       ├── entity_ops.py    # shared row operations
 │       ├── generator.py     # synthetic value generation
 │       ├── batch.py         # bulk generation, replace/reset, change batches
 │       ├── scheduler.py     # per-entity insert/mutate/soft-delete jobs
 │       ├── changefeed.py    # change_log writes + /changes reads
 │       ├── export.py        # snapshot / delta / bundle
-│       ├── ddl.py           # CREATE TABLE / INDEX
+│       ├── ddl.py           # CREATE TABLE / INDEX (+ CREATE SCHEMA for a project)
 │       └── metrics.py       # /metrics and /scheduler/runs
-├── tests/
+├── tests/                   # entity_fixtures.py owns the built-in test entities; conftest builds the rest
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -475,7 +532,9 @@ Imports flow downwards: `api/` and `cli.py` → `services/` → `db/`, `config/`
 - **In-process scheduler** (APScheduler) — simplest to run and demo.
 - **Startup seeding is dependency-ordered** — `ref` fields always resolve.
 - **Namespaced tables, logical names** — internal `d_<id>_<name>`; external API always uses provider names.
-- **One access check** — `catalog.resolve` is the single gate for read/write/private rules.
+- **A project is a scope, not a prefix** — the engine is handed one project's `(configs, tables)` at a time, so refs, bulk refresh and bundles can't cross projects by construction. Table names stay `d_<id>_<name>` (no real database schema is created at runtime — SQLite has none); the schema appears in the **exports**.
+- **Visibility lives on the project** — one switch per schema, so a shared table can never reference a hidden parent.
+- **Two access checks** — `catalog.resolve` (configs) and `catalog.resolve_project` (projects) are the only gates for read/write/private rules; a test walks the route table to prove no route skips them.
 - **Hashed provider keys** — SHA-256 of 256-bit secrets; lookup by hash.
 - **Legacy and `/v1` share `entity_ops.py`** — routes can’t drift apart.
 
@@ -496,9 +555,10 @@ Deliberate simplifications, not bugs:
 | Single instance    | Catalog, scheduler and write lock live in one process’s memory                         |
 | Field changes      | Drop + re-seed (no `ALTER`); requires `confirm=true`                                   |
 | Change log growth  | Never trimmed except by `reset` or deleting the config                                 |
-| Sharing model      | All-or-nothing (`is_only_me`); no per-provider grants                                  |
+| Sharing model      | All-or-nothing per project (`is_only_me`); no per-config switch, no per-provider grants |
+| Cross-project refs | A `ref` can't point outside its project — copy the parent into the project instead      |
 | Superuser          | One role via env vars; no per-admin identity or audit trail                            |
-| Not implemented    | Schema-drift injection, cron cadences, migrations (`create_all` only)                  |
+| Not implemented    | Schema-drift injection, cron cadences, a migration framework (`create_all` plus one additive, idempotent step for the projects upgrade) |
 
 See the full list in the source documentation for measured sizes, export edge cases, and operational notes.
 

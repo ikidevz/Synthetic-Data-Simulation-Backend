@@ -1,18 +1,24 @@
-"""Publishing configs: create (JSON and YAML), validate, limits, edit, delete, the scheduler."""
-import os
+"""Publishing configs into a project: create (JSON and YAML), validate, limits, edit, delete,
+the scheduler. (Projects themselves are in test_v1_projects.py.)
+
+The repo's configs/*.yaml are examples and are deliberately NOT used here: every config
+below is built in the test, from conftest's helpers."""
 import re
 
 import pytest
+import yaml
 from sqlalchemy import inspect, select, func
 
 from app.db import models
 from app.services.catalog import catalog
 from app.db.engine import engine
 from app.services.scheduler import run_entity_job
-from conftest import customers_cfg, make_provider, orders_cfg, publish
+from conftest import customers_cfg, default_project, make_project, make_provider, orders_cfg, publish
 
-CONFIGS_DIR = os.path.join(os.path.dirname(
-    os.path.dirname(__file__)), "configs")
+
+def cfg_url(client, who, project=None):
+    """Where a config is posted: the provider's `main` project unless one is named."""
+    return f"/v1/projects/{project or default_project(client, who)}/configs"
 
 
 def tables_in_db():
@@ -28,7 +34,8 @@ def test_create_returns_the_config_its_owner_and_the_seeded_row_count(client, su
     made = publish(client, alice, customers_cfg("c_basic", count=7))
     assert made["id"].startswith("cfg_") and made["name"] == "c_basic"
     assert made["owner"] == {"id": alice["id"], "full_name": "Alice Almeida"}
-    assert made["is_only_me"] is False and made["source"] == "api" and made["can_write"] is True
+    assert made["project"]["name"] == "main" and made["project"]["is_only_me"] is False
+    assert made["source"] == "api" and made["can_write"] is True
     assert made["seeded_rows"] == 7
     assert made["config"]["fields"]["version"] == {
         "type": "int", "primary_key": False, "nullable": False, "auto": "version"}
@@ -37,15 +44,16 @@ def test_create_returns_the_config_its_owner_and_the_seeded_row_count(client, su
     assert len(rows) == 7 and all(r["version"] >= 1 for r in rows)
 
 
-def test_a_yaml_file_posts_as_is(client, alice):
-    for fname in ("customers.yaml", "orders.yaml"):
-        with open(os.path.join(CONFIGS_DIR, fname)) as fh:
-            resp = client.post("/v1/configs", content=fh.read(),
-                               headers={**alice["h"], "Content-Type": "text/yaml"})
+def test_a_yaml_body_posts_as_is(client, alice):
+    """A YAML document (what a file under configs/ looks like) posts straight to a project.
+    The YAML is built here from the test's own dicts: the example files are not read."""
+    for cfg in (customers_cfg("yaml_cust", count=3), orders_cfg("yaml_cust", name="yaml_ord", count=4)):
+        resp = client.post(cfg_url(client, alice), content=yaml.safe_dump(cfg),
+                           headers={**alice["h"], "Content-Type": "text/yaml"})
         assert resp.status_code == 201, resp.text
     names = {i["name"] for i in client.get(
         "/v1/configs?scope=mine", headers=alice["h"]).json()["items"]}
-    assert {"customers", "orders"} <= names
+    assert {"yaml_cust", "yaml_ord"} <= names
 
 
 def test_the_data_lives_in_a_namespaced_table_but_the_config_uses_your_names(client, alice):
@@ -84,45 +92,65 @@ def test_the_longest_allowed_names_fit_in_database_identifiers(client, alice):
         f"/v1/configs/{child['id']}/data", headers=alice["h"]).status_code == 200
     assert f"CREATE TABLE IF NOT EXISTS {long_name}" in client.get(
         f"/v1/configs/{child['id']}/ddl", headers=alice["h"]).text
-    assert client.post("/v1/configs/validate", json=customers_cfg("a" * 33),
+    assert client.post(cfg_url(client, alice) + "/validate", json=customers_cfg("a" * 33),
                        headers=alice["h"]).status_code == 422
 
 
-def test_a_name_is_unique_per_provider(client, alice):
+def test_a_config_name_is_unique_per_project_not_per_provider(client, alice):
     publish(client, alice, customers_cfg("dupe"))
     resp = client.post(
-        "/v1/configs", json=customers_cfg("dupe"), headers=alice["h"])
+        cfg_url(client, alice), json=customers_cfg("dupe"), headers=alice["h"])
     assert resp.status_code == 409 and resp.json(
     )["error"]["code"] == "already_exists"
+    # another project is another schema: the same table name is fine there
+    other = make_project(client, alice, "dupe_elsewhere")
+    again = publish(client, alice, customers_cfg("dupe"), project=other["id"])
+    assert again["project"]["id"] == other["id"]
 
 
-def test_a_name_that_matches_a_built_in_example_is_taken_for_the_superuser(client, su):
-    # system provider owns `orders`
-    resp = client.post("/v1/configs", json=customers_cfg("orders"), headers=su)
-    assert resp.status_code == 409
+def test_the_built_in_examples_project_takes_no_new_configs_and_its_name_is_taken(client, su):
+    examples = "prj_system_examples"
+    resp = client.post(
+        f"/v1/projects/{examples}/configs", json=customers_cfg("extra"), headers=su)
+    assert resp.status_code == 409 and resp.json(
+    )["error"]["code"] == "managed_by_yaml"
+    dry = client.post(
+        f"/v1/projects/{examples}/configs/validate", json=customers_cfg("extra"), headers=su)
+    assert dry.status_code == 409 and dry.json(
+    )["error"]["code"] == "managed_by_yaml"
+    # the system provider already owns a project called `examples`
+    assert client.post(
+        "/v1/projects", json={"name": "examples"}, headers=su).status_code == 409
 
 
-def test_is_only_me_defaults_to_shared(client, alice):
-    assert publish(client, alice, customers_cfg("c_default"))[
-        "is_only_me"] is False
-    assert publish(client, alice, customers_cfg(
-        "c_private", is_only_me=True))["is_only_me"] is True
+def test_a_projects_visibility_applies_to_the_configs_in_it(client, alice, bob):
+    shared = publish(client, alice, customers_cfg("c_default"))
+    assert shared["project"]["is_only_me"] is False
+    hidden = make_project(client, alice, "c_hidden_project", is_only_me=True)
+    private = publish(client, alice, customers_cfg(
+        "c_private"), project=hidden["id"])
+    assert private["project"]["is_only_me"] is True
+    assert client.get(
+        f"/v1/configs/{shared['id']}", headers=bob["h"]).status_code == 200
+    assert client.get(
+        f"/v1/configs/{private['id']}", headers=bob["h"]).status_code == 404
 
 
 # --------------------------------------------------------------- validate ----
 def test_validate_checks_everything_and_saves_nothing(client, alice):
     before = len(client.get("/v1/configs?scope=mine",
                  headers=alice["h"]).json()["items"])
-    ok = client.post("/v1/configs/validate",
+    ok = client.post(cfg_url(client, alice) + "/validate",
                      json=customers_cfg("v_dry", count=2), headers=alice["h"])
     assert ok.status_code == 200
     body = ok.json()
     assert body["valid"] is True and body["name_available"] is True and "version" in body["config"]["fields"]
+    assert body["project"]["name"] == "main"
     assert len(client.get("/v1/configs?scope=mine",
                headers=alice["h"]).json()["items"]) == before
 
     publish(client, alice, customers_cfg("v_taken"))
-    assert client.post("/v1/configs/validate", json=customers_cfg("v_taken"),
+    assert client.post(cfg_url(client, alice) + "/validate", json=customers_cfg("v_taken"),
                        headers=alice["h"]).json()["name_available"] is False
 
 
@@ -159,7 +187,7 @@ def cfg_with(**changes):
     (lambda c: c["fields"].update(
         extra={"type": "string", "values": ["a"]}), "only applies to type: enum"),
     (lambda c: c["fields"].update(
-        extra={"type": "ref", "ref_entity": "nope"}), "not one of your configs"),
+        extra={"type": "ref", "ref_entity": "nope"}), "not one of this project's configs"),
     (lambda c: c["fields"].update(
         extra={"type": "int", "min": 5, "max": 1}), "min"),
     (lambda c: c["fields"].update(
@@ -182,42 +210,50 @@ def cfg_with(**changes):
 def test_bad_configs_are_rejected_with_a_clear_reason(client, alice, mutate, fragment):
     cfg = customers_cfg("bad_one")
     mutate(cfg)
-    resp = client.post("/v1/configs/validate", json=cfg, headers=alice["h"])
+    resp = client.post(cfg_url(client, alice) + "/validate",
+                       json=cfg, headers=alice["h"])
     assert resp.status_code == 422, resp.text
     err = resp.json()["error"]
     assert err["code"] == "invalid_config" and fragment in err["message"], err
     # and creating it fails the same way, leaving nothing behind
     names_before = {i["name"] for i in client.get(
         "/v1/configs?scope=mine", headers=alice["h"]).json()["items"]}
-    assert client.post("/v1/configs", json=cfg,
+    assert client.post(cfg_url(client, alice), json=cfg,
                        headers=alice["h"]).status_code == 422
     names_after = {i["name"] for i in client.get(
         "/v1/configs?scope=mine", headers=alice["h"]).json()["items"]}
     assert names_before == names_after
 
 
-def test_a_config_cannot_reference_another_providers_config(client, alice, bob):
+def test_a_config_cannot_reference_a_config_outside_its_project(client, alice, bob):
+    """Refs resolve inside one schema: not another provider's, and not even your own other project's."""
     publish(client, alice, customers_cfg("alice_parent"))
-    resp = client.post(
-        "/v1/configs", json=orders_cfg("alice_parent", name="bob_child"), headers=bob["h"])
-    assert resp.status_code == 422 and "not one of your configs" in resp.json()[
-        "error"]["message"]
+    msg = "not one of this project's configs"
+    resp = client.post(cfg_url(client, bob), json=orders_cfg("alice_parent", name="bob_child"),
+                       headers=bob["h"])
+    assert resp.status_code == 422 and msg in resp.json()["error"]["message"]
+    other = make_project(client, alice, "ref_other")
+    resp = client.post(cfg_url(client, alice, other["id"]),
+                       json=orders_cfg("alice_parent", name="alice_child"), headers=alice["h"])
+    assert resp.status_code == 422 and msg in resp.json()["error"]["message"]
+    # inside the project it works
+    publish(client, alice, orders_cfg("alice_parent", name="alice_child"))
 
 
 def test_body_problems(client, alice):
     h = alice["h"]
-    assert client.post("/v1/configs", content=b"{not json", headers={
+    assert client.post(cfg_url(client, alice), content=b"{not json", headers={
                        **h, "Content-Type": "application/json"}).status_code == 422
-    assert client.post("/v1/configs", content="- a\n- list\n",
+    assert client.post(cfg_url(client, alice), content="- a\n- list\n",
                        headers={**h, "Content-Type": "text/yaml"}).status_code == 422
-    assert client.post("/v1/configs", content=b"\xff\xfe",
+    assert client.post(cfg_url(client, alice), content=b"\xff\xfe",
                        headers={**h, "Content-Type": "text/yaml"}).status_code == 422
     bomb = "a: &a [1,2,3]\nb: &b [*a,*a]\nc: [*b,*b]\n"
-    resp = client.post("/v1/configs", content=bomb,
+    resp = client.post(cfg_url(client, alice), content=bomb,
                        headers={**h, "Content-Type": "text/yaml"})
     assert resp.status_code == 422 and "anchors" in resp.json()[
         "error"]["message"]
-    huge = client.post("/v1/configs", content="x: " + "y" *
+    huge = client.post(cfg_url(client, alice), content="x: " + "y" *
                        70_000, headers={**h, "Content-Type": "text/yaml"})
     assert huge.status_code == 413 and huge.json(
     )["error"]["code"] == "payload_too_large"
@@ -226,7 +262,7 @@ def test_body_problems(client, alice):
 def test_a_parent_with_no_rows_fails_cleanly_and_leaves_nothing_behind(client, alice):
     parent = publish(client, alice, customers_cfg("empty_parent", count=0))
     before = tables_in_db()
-    resp = client.post("/v1/configs", json=orders_cfg("empty_parent",
+    resp = client.post(cfg_url(client, alice), json=orders_cfg("empty_parent",
                        name="starved_child"), headers=alice["h"])
     assert resp.status_code == 409 and resp.json(
     )["error"]["code"] == "missing_parent_rows"
@@ -243,7 +279,7 @@ def test_a_parent_with_no_rows_fails_cleanly_and_leaves_nothing_behind(client, a
 
 
 # ---------------------------------------------------------------- quotas ----
-def test_per_provider_quotas(client, su, monkeypatch):
+def test_per_provider_config_quotas(client, su, monkeypatch):
     p = make_provider(client, su, "Quota Q")
     monkeypatch.setenv("MAX_CONFIGS_PER_PROVIDER", "2")
     monkeypatch.setenv("MAX_FIELDS_PER_CONFIG", "9")
@@ -251,19 +287,19 @@ def test_per_provider_quotas(client, su, monkeypatch):
     monkeypatch.setenv("MAX_LATENCY_MS", "50")
     publish(client, p, customers_cfg("q1", count=20))
     over = client.post(
-        "/v1/configs", json=customers_cfg("q2", count=21), headers=p["h"])
+        cfg_url(client, p), json=customers_cfg("q2", count=21), headers=p["h"])
     assert over.status_code == 422 and "initial_count" in over.json()[
         "error"]["message"]
     wide = customers_cfg("q2")
     wide["fields"].update({f"f{i}": {"type": "int"} for i in range(5)})
-    assert client.post("/v1/configs", json=wide,
+    assert client.post(cfg_url(client, p), json=wide,
                        headers=p["h"]).status_code == 422
     slow = customers_cfg("q2", failure_injection={"latency_ms": 51})
-    assert client.post("/v1/configs", json=slow,
+    assert client.post(cfg_url(client, p), json=slow,
                        headers=p["h"]).status_code == 422
     publish(client, p, customers_cfg("q2"))
     third = client.post(
-        "/v1/configs", json=customers_cfg("q3"), headers=p["h"])
+        cfg_url(client, p), json=customers_cfg("q3"), headers=p["h"])
     assert third.status_code == 409 and third.json(
     )["error"]["code"] == "quota_exceeded"
     # deleting one frees a slot
@@ -277,7 +313,9 @@ def test_per_provider_quotas(client, su, monkeypatch):
 # ------------------------------------------------------------------ list ----
 def test_listing_scopes(client, su, alice, bob):
     pub = publish(client, alice, customers_cfg("l_pub"))
-    priv = publish(client, alice, customers_cfg("l_priv", is_only_me=True))
+    hidden = make_project(client, alice, "l_hidden", is_only_me=True)
+    priv = publish(client, alice, customers_cfg(
+        "l_priv"), project=hidden["id"])
     def names(who, scope): return {i["name"] for i in client.get(
         f"/v1/configs?scope={scope}", headers=who["h"]).json()["items"]}
     assert {"l_pub", "l_priv"} <= names(alice, "mine") and not names(
@@ -324,16 +362,6 @@ def test_patch_merges_schedule_and_failure_settings_and_reschedules(client, alic
     assert entry_of(cid).cfg.failure_injection.latency_ms == 5
     assert client.get(f"/v1/configs/{cid}", headers=alice["h"]).json()[
         "config"]["update_schedule"]["cadence"] == "daily"
-
-
-def test_patch_can_toggle_is_only_me_and_nothing_else_changes(client, alice):
-    made = publish(client, alice, customers_cfg("p_flag", count=4))
-    resp = client.patch(
-        f"/v1/configs/{made['id']}", json={"is_only_me": True}, headers=alice["h"])
-    assert resp.status_code == 200 and resp.json(
-    )["is_only_me"] is True and resp.json()["data_reset"] is False
-    assert len(client.get(
-        f"/v1/configs/{made['id']}/data?limit=50", headers=alice["h"]).json()["items"]) == 4
 
 
 @pytest.mark.parametrize("body, status", [
@@ -414,11 +442,17 @@ def test_built_in_yaml_configs_are_managed_by_their_files(client, su):
     )["error"]["code"] == "managed_by_yaml"
     assert client.delete(
         "/v1/configs/cfg_sys_orders?confirm=true", headers=su).status_code == 409
-    flag = client.patch("/v1/configs/cfg_sys_support_tickets",
-                        json={"is_only_me": True}, headers=su)
-    assert flag.status_code == 200 and flag.json()["is_only_me"] is True
-    client.patch("/v1/configs/cfg_sys_support_tickets",
-                 json={"is_only_me": False}, headers=su)
+    # the project that holds them can be hidden and shown again, but not renamed or deleted
+    examples = "/v1/projects/prj_system_examples"
+    assert client.patch(examples, json={"is_only_me": True}, headers=su).json()[
+        "is_only_me"] is True
+    assert client.patch(examples, json={"is_only_me": False}, headers=su).json()[
+        "is_only_me"] is False
+    renamed = client.patch(examples, json={"name": "mine"}, headers=su)
+    assert renamed.status_code == 409 and renamed.json(
+    )["error"]["code"] == "managed_by_yaml"
+    assert client.delete(examples + "?confirm=true",
+                         headers=su).status_code == 409
 
 
 # ---------------------------------------------------------------- delete ----

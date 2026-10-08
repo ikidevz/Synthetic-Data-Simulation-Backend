@@ -1,7 +1,10 @@
 import os
+import tempfile
 
 import pytest
 from fastapi.testclient import TestClient
+
+from entity_fixtures import write_entity_dir
 
 # app.db.engine reads DATABASE_URL once, at import time. So this has to run BEFORE
 # anything under `app` is imported — otherwise the engine silently points at whatever
@@ -22,7 +25,17 @@ else:
         os.remove(TEST_DB_PATH)
     os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB_PATH}"
 
-# Provider tests create many configs under one provider; the quota tests set their own limits.
+# The suite never reads the repo's configs/ directory (those files are examples only). The
+# built-in entities the legacy-route tests need come from tests/entity_fixtures.py, written
+# to a temp directory that CONFIG_DIR points at BEFORE the app is imported.
+TEST_CONFIG_DIR = write_entity_dir(
+    tempfile.mkdtemp(prefix="synthetic-test-entities-"))
+os.environ["CONFIG_DIR"] = TEST_CONFIG_DIR
+
+# Provider tests create many projects/configs under one provider; the quota tests set their
+# own limits.
+os.environ.setdefault("MAX_PROJECTS_PER_PROVIDER", "500")
+os.environ.setdefault("MAX_CONFIGS_PER_PROJECT", "500")
 os.environ.setdefault("MAX_CONFIGS_PER_PROVIDER", "500")
 
 from app.main import app  # noqa: E402  (must follow the DATABASE_URL setup above)
@@ -128,8 +141,39 @@ def orders_cfg(parent="customers", name="orders", count=8, **extra):
     }
 
 
-def publish(client, who, cfg, expect=201):
-    resp = client.post("/v1/configs", json=cfg,
-                       headers=who["h"] if "h" in who else who)
+def _headers(who):
+    return who["h"] if "h" in who else who
+
+
+def make_project(client, who, name="main", expect=201, **extra):
+    """Create a project for `who` and return its JSON."""
+    resp = client.post(
+        "/v1/projects", json={"name": name, **extra}, headers=_headers(who))
+    assert resp.status_code == expect, resp.text
+    return resp.json()
+
+
+# One project per (provider, project name), created on first use. `publish` files configs
+# under it, so most tests can stay about configs; the project tests exercise projects directly.
+_DEFAULT_PROJECTS: dict = {}
+
+
+def default_project(client, who, name="main"):
+    h = _headers(who)
+    key = (h["X-API-Key"], name)
+    if key not in _DEFAULT_PROJECTS:
+        listed = client.get(
+            "/v1/projects", params={"scope": "mine"}, headers=h).json()["items"]
+        found = next((p for p in listed if p["name"] == name), None)
+        _DEFAULT_PROJECTS[key] = (
+            found or make_project(client, who, name))["id"]
+    return _DEFAULT_PROJECTS[key]
+
+
+def publish(client, who, cfg, expect=201, project=None):
+    """Publish a config into `project` (a project id), or into the provider's `main` project."""
+    pid = project or default_project(client, who)
+    resp = client.post(
+        f"/v1/projects/{pid}/configs", json=cfg, headers=_headers(who))
     assert resp.status_code == expect, resp.text
     return resp.json()

@@ -129,7 +129,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         except ApiError as exc:
             print(f"error [{exc.code}]: {exc.message}", file=sys.stderr)
             return 1
-        print(json.dumps({**provider, "created": True, "api_key": key["api_key"]}, indent=2))
+        print(json.dumps({**provider, "created": True,
+              "api_key": key["api_key"]}, indent=2))
         return 0
     try:
         configs = load_entity_configs(get_config_dir())

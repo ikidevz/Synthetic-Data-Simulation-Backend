@@ -1,6 +1,8 @@
-"""Database-backed registry: providers, their API keys, and the configs they published.
+"""Database-backed registry: providers, their API keys, their projects, and the configs
+published inside those projects.
 
-A *provider* is a publisher of configs (an `id` and a `full_name`). Each provider
+A *provider* is a publisher (an `id` and a `full_name`). A *project* is a schema: a named
+group of configs (tables) owned by one provider. A *config* is one table. Each provider
 authenticates with one or more API keys. Keys are random 256-bit values; only their
 SHA-256 is stored (a fast hash is appropriate precisely because the secret is
 high-entropy — there is nothing to brute-force), and the key itself is returned
@@ -19,7 +21,7 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import Index, delete, func, insert, inspect, select, text, update
+from sqlalchemy import Boolean, DateTime, Index, String, Text, delete, func, insert, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.schema import CreateIndex
 
@@ -31,6 +33,11 @@ logger = logging.getLogger("registry")
 
 SYSTEM_PROVIDER_ID = "prov_system"
 SYSTEM_PROVIDER_NAME = "System (built-in examples)"
+# The built-in YAML examples live in one read-only project owned by the system provider.
+SYSTEM_PROJECT_ID = "prj_system_examples"
+SYSTEM_PROJECT_NAME = "examples"
+# what migrated, pre-projects configs are filed under
+DEFAULT_PROJECT_NAME = "default"
 MAX_FULL_NAME = 100
 _LAST_USED_REFRESH = timedelta(minutes=5)
 
@@ -97,15 +104,16 @@ def ensure_name_key_column() -> None:
         return  # create_all has not run yet; the column arrives with the new table
     if "name_key" not in {c["name"] for c in inspector.get_columns("registry_providers")}:
         with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE registry_providers ADD COLUMN name_key VARCHAR"))
+            conn.execute(
+                text("ALTER TABLE registry_providers ADD COLUMN name_key VARCHAR"))
     # Backfill before indexing: the unique index cannot be built while rows hold NULL or
     # colliding keys. This runs on every startup, so it must only touch rows that are
     # actually wrong -- rewriting correct rows would be churn, and rewriting them one by
     # one can transiently collide with a row that is about to be updated.
     with engine.begin() as conn:
         rows = conn.execute(select(models.registry_providers.c.id,
-                                  models.registry_providers.c.full_name,
-                                  models.registry_providers.c.name_key)).all()
+                                   models.registry_providers.c.full_name,
+                                   models.registry_providers.c.name_key)).all()
         seen: set = set()
         for pid, full_name, stored in rows:
             key = _name_key(full_name or "")
@@ -122,8 +130,8 @@ def ensure_name_key_column() -> None:
                 seen.add(key)
                 new_key = key
             conn.execute(update(models.registry_providers)
-                          .where(models.registry_providers.c.id == pid)
-                          .values(name_key=new_key))
+                         .where(models.registry_providers.c.id == pid)
+                         .values(name_key=new_key))
     index = Index("uq_registry_providers_name_key",
                   models.registry_providers.c.name_key, unique=True)
     try:
@@ -243,7 +251,8 @@ def provider_by_name_key(key: str) -> Optional[Dict[str, Any]]:
             models.registry_providers.c.name_key == key)).first()
         if row is None:
             for candidate in conn.execute(
-                select(models.registry_providers.c.id, models.registry_providers.c.full_name)
+                select(models.registry_providers.c.id,
+                       models.registry_providers.c.full_name)
             ).mappings():
                 if _name_key(candidate["full_name"] or "") == key:
                     row = (candidate["id"],)
@@ -312,7 +321,7 @@ def update_provider(provider_id: str, full_name: Any = None, is_active: Optional
 
 
 def list_providers() -> List[Dict[str, Any]]:
-    """Every provider with its keys (never the secrets) and how many configs it owns."""
+    """Every provider with its keys (never the secrets) and how many projects / configs it owns."""
     with engine.connect() as conn:
         providers = [dict(r) for r in conn.execute(
             select(models.registry_providers).order_by(
@@ -326,9 +335,14 @@ def list_providers() -> List[Dict[str, Any]]:
             select(models.registry_configs.c.provider_id, func.count()
                    ).group_by(models.registry_configs.c.provider_id)
         ).all())
+        project_counts = dict(conn.execute(
+            select(models.registry_projects.c.provider_id, func.count()
+                   ).group_by(models.registry_projects.c.provider_id)
+        ).all())
     out = []
     for p in providers:
         item = _provider_dict(p)
+        item["project_count"] = project_counts.get(p["id"], 0)
         item["config_count"] = counts.get(p["id"], 0)
         item["keys"] = [_key_dict(k)
                         for k in keys if k["provider_id"] == p["id"]]
@@ -419,6 +433,65 @@ def authenticate(key: str) -> Optional[Dict[str, Any]]:
     return {"provider_id": row["provider_id"], "full_name": row["full_name"], "key_id": row["id"]}
 
 
+# ------------------------------------------------------------- projects ----
+def _project_dict(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "provider_id": row["provider_id"],
+        "name": row["name"],
+        "description": row["description"],
+        "is_only_me": bool(row["is_only_me"]),
+        "source": row["source"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def ensure_system_project() -> None:
+    """The project that holds the built-in YAML examples (owned by the system provider)."""
+    with engine.begin() as conn:
+        exists = conn.execute(select(models.registry_projects.c.id).where(
+            models.registry_projects.c.id == SYSTEM_PROJECT_ID)).first()
+        if not exists:
+            now = _now()
+            conn.execute(insert(models.registry_projects).values(
+                id=SYSTEM_PROJECT_ID, provider_id=SYSTEM_PROVIDER_ID, name=SYSTEM_PROJECT_NAME,
+                description="Built-in example configs loaded from the configs/ directory.",
+                is_only_me=False, source="yaml", created_at=now, updated_at=now))
+
+
+def list_project_rows(provider_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    p = models.registry_projects
+    stmt = select(p).order_by(p.c.created_at, p.c.id)
+    if provider_id:
+        stmt = stmt.where(p.c.provider_id == provider_id)
+    with engine.connect() as conn:
+        return [_project_dict(dict(r)) for r in conn.execute(stmt).mappings()]
+
+
+def insert_project_row(row: Dict[str, Any]) -> None:
+    """Insert a project. The (provider, name) UNIQUE constraint is the arbiter of a race, so
+    a lost one is reported like any other clash instead of a 500."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(insert(models.registry_projects).values(**row))
+    except IntegrityError:
+        raise ApiError("already_exists",
+                       f"you already have a project named '{row['name']}'", 409)
+
+
+def update_project_row(project_id: str, **values: Any) -> None:
+    with engine.begin() as conn:
+        conn.execute(update(models.registry_projects).where(
+            models.registry_projects.c.id == project_id).values(updated_at=_now(), **values))
+
+
+def delete_project_row(project_id: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(delete(models.registry_projects).where(
+            models.registry_projects.c.id == project_id))
+
+
 # -------------------------------------------------------------- configs ----
 def list_config_rows(source: Optional[str] = None) -> List[Dict[str, Any]]:
     c = models.registry_configs
@@ -451,7 +524,7 @@ def delete_config_row(config_id: str) -> None:
 
 def sync_yaml_rows(rows: List[Dict[str, Any]]) -> None:
     """Make the registry's "yaml" rows mirror the YAML files exactly: the files are the
-    source of truth for those configs. `is_only_me` is preserved across restarts."""
+    source of truth for those configs. (Their project's `is_only_me` is kept across restarts.)"""
     c = models.registry_configs
     wanted = {r["id"] for r in rows}
     with engine.begin() as conn:
@@ -462,8 +535,98 @@ def sync_yaml_rows(rows: List[Dict[str, Any]]) -> None:
         for r in rows:
             if r["id"] in existing:
                 conn.execute(update(c).where(c.c.id == r["id"]).values(
-                    config_json=r["config_json"], physical_name=r["physical_name"], name=r["name"], updated_at=_now(
-                    )
+                    config_json=r["config_json"], physical_name=r["physical_name"], name=r["name"],
+                    project_id=r["project_id"], updated_at=_now()
                 ))
             else:
                 conn.execute(insert(c).values(**r))
+
+
+# ------------------------------------------------------------ migration ----
+def migrate_to_projects() -> None:
+    """Move a pre-projects database onto the projects model. Idempotent; runs at startup.
+
+    Before projects, a config belonged straight to a provider and carried its own
+    `is_only_me`. Now every config sits in a project, and visibility is the project's. For
+    each provider that already has configs this creates one project named `default` and
+    files them there; the built-in YAML examples go to the system `examples` project.
+
+    Privacy is never loosened: if ANY of a provider's configs was private, the whole
+    `default` project is private (a project is shared or private as a unit). Table names
+    don't change, so no data moves. `registry_configs` is rebuilt rather than altered
+    because its UNIQUE constraint changes (provider+name -> project+name), which SQLite
+    cannot do in place. The old table is only dropped after the new one is filled, and a
+    leftover `registry_configs_old` from an interrupted run is picked up again.
+    """
+    names = set(inspect(engine).get_table_names())
+    if "registry_configs" not in names and "registry_configs_old" not in names:
+        return  # brand-new database: create_all builds the current shape
+    old = "registry_configs_old" if "registry_configs_old" in names else "registry_configs"
+    if old == "registry_configs":
+        cols = {c["name"]
+                for c in inspect(engine).get_columns("registry_configs")}
+        if "project_id" in cols and "is_only_me" not in cols:
+            return  # already current
+
+    models.registry_projects.create(engine, checkfirst=True)
+    ensure_system_provider()
+    ensure_system_project()
+    # typed columns, so SQLite hands back real datetimes (a bare SELECT returns strings,
+    # which the INSERT into the rebuilt table would then refuse)
+    legacy_query = text(
+        "SELECT id, provider_id, name, physical_name, config_json, is_only_me, source, "
+        f"created_at, updated_at FROM {old}"
+    ).columns(id=String, provider_id=String, name=String, physical_name=String, config_json=Text,
+              is_only_me=Boolean, source=String, created_at=DateTime, updated_at=DateTime)
+    with engine.connect() as conn:
+        legacy = [dict(r) for r in conn.execute(legacy_query).mappings()]
+
+    by_provider: Dict[str, List[Dict[str, Any]]] = {}
+    for row in legacy:
+        if row["source"] != "yaml":
+            by_provider.setdefault(row["provider_id"], []).append(row)
+    project_for: Dict[str, str] = {}
+    now = _now()
+    for provider_id, rows in by_provider.items():
+        private = [r["name"] for r in rows if r.get("is_only_me")]
+        if private and len(private) != len(rows):
+            logger.warning(
+                "migrating %s: %d of its configs were private, so its 'default' project is "
+                "private (%s). Re-share it with PATCH /v1/projects/<id> if that was too strict.",
+                provider_id, len(private), ", ".join(sorted(private)))
+        # an interrupted earlier run may already have made this provider's project
+        already = next((p for p in list_project_rows(provider_id)
+                        if p["name"] == DEFAULT_PROJECT_NAME), None)
+        if already:
+            project_for[provider_id] = already["id"]
+            continue
+        pid = new_id("prj")
+        project_for[provider_id] = pid
+        insert_project_row({
+            "id": pid, "provider_id": provider_id, "name": DEFAULT_PROJECT_NAME,
+            "description": "Created automatically when projects were introduced.",
+            "is_only_me": bool(private), "source": "api", "created_at": now, "updated_at": now})
+    yaml_private = any(r["source"] == "yaml" and r.get(
+        "is_only_me") for r in legacy)
+    if yaml_private:
+        update_project_row(SYSTEM_PROJECT_ID, is_only_me=True)
+
+    with engine.begin() as conn:
+        if old == "registry_configs":
+            conn.execute(
+                text("ALTER TABLE registry_configs RENAME TO registry_configs_old"))
+        # index names are global to the schema: free the one the new table is about to use
+        conn.execute(
+            text("DROP INDEX IF EXISTS ix_registry_configs_provider_id"))
+        # a partial table from a crashed run
+        models.registry_configs.drop(conn, checkfirst=True)
+        models.registry_configs.create(conn)
+        for row in legacy:
+            project_id = (SYSTEM_PROJECT_ID if row["source"] == "yaml"
+                          else project_for[row["provider_id"]])
+            conn.execute(insert(models.registry_configs).values(
+                id=row["id"], provider_id=row["provider_id"], project_id=project_id,
+                name=row["name"], physical_name=row["physical_name"],
+                config_json=row["config_json"], source=row["source"],
+                created_at=row["created_at"], updated_at=row["updated_at"]))
+        conn.execute(text("DROP TABLE registry_configs_old"))

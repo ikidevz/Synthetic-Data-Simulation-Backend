@@ -6,7 +6,8 @@ from app.config.entities import load_entity_configs
 from app.services.generator import generate_row, generate_field_value
 
 
-CONFIG_DIR = os.path.join(os.path.dirname(__file__), "..", "configs")
+# a tests-owned dir, not the repo configs/
+from conftest import TEST_CONFIG_DIR as CONFIG_DIR
 
 
 def test_loads_valid_configs():

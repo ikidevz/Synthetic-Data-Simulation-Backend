@@ -59,7 +59,8 @@ def test_provider_full_name_is_validated(client, su, name):
 
 def test_a_taken_full_name_is_a_409_not_a_second_provider(client, su):
     a = make_provider(client, su, "Twin")
-    again = client.post("/v1/admin/providers", json={"full_name": "Twin"}, headers=su)
+    again = client.post("/v1/admin/providers",
+                        json={"full_name": "Twin"}, headers=su)
     assert again.status_code == 409
     err = again.json()["error"]
     assert err["code"] == "already_exists" and a["id"] in err["message"]
@@ -75,7 +76,8 @@ def test_a_taken_full_name_is_a_409_not_a_second_provider(client, su):
 
 
 def test_on_exists_reuse_is_idempotent_and_issues_no_key(client, su):
-    first = client.post("/v1/admin/providers", json={"full_name": "Retryable"}, headers=su).json()
+    first = client.post("/v1/admin/providers",
+                        json={"full_name": "Retryable"}, headers=su).json()
     assert first["created"] is True and first["api_key"]
 
     # the same request again: same provider, nothing created, and no new secret
@@ -91,7 +93,8 @@ def test_on_exists_reuse_is_idempotent_and_issues_no_key(client, su):
                   if p["id"] == first["id"])
     assert len(listed["keys"]) == 1  # the retry did not mint a second key
     # and the first key still works
-    assert client.get("/v1/me", headers={"X-API-Key": first["api_key"]}).json()["id"] == first["id"]
+    assert client.get(
+        "/v1/me", headers={"X-API-Key": first["api_key"]}).json()["id"] == first["id"]
 
     # a still-unused name is created normally through the same call
     fresh = client.post("/v1/admin/providers", params={"on_exists": "reuse"},
@@ -101,7 +104,8 @@ def test_on_exists_reuse_is_idempotent_and_issues_no_key(client, su):
 
 def test_names_that_look_identical_are_still_one_provider(client, su):
     """Characters that render as nothing must not buy you a second copy of a name."""
-    client.post("/v1/admin/providers", json={"full_name": "Uni Form"}, headers=su)
+    client.post("/v1/admin/providers",
+                json={"full_name": "Uni Form"}, headers=su)
     # Built with chr() rather than literals: these characters are invisible in an
     # editor and get silently mangled when written out by hand. Each variant spells
     # "Uni Form" using a different separator, so they must all normalise to the same name.
@@ -118,13 +122,15 @@ def test_names_that_look_identical_are_still_one_provider(client, su):
                            json={"full_name": variant},
                            headers=su).status_code == 409, ascii(variant)
     # the ligature and full-width spellings of a *different* name normalise to the same thing
-    client.post("/v1/admin/providers", json={"full_name": "fin co"}, headers=su)
+    client.post("/v1/admin/providers",
+                json={"full_name": "fin co"}, headers=su)
     for variant in (chr(0xFB01) + "n co",     # the "fi" ligature
                     "".join(chr(c) for c in (0xFF26, 0xFF29, 0xFF4E)) + " co"):
         assert client.post("/v1/admin/providers",
                            json={"full_name": variant},
                            headers=su).status_code == 409, ascii(variant)
-    names = [p["full_name"] for p in client.get("/v1/admin/providers", headers=su).json()["items"]]
+    names = [p["full_name"] for p in client.get(
+        "/v1/admin/providers", headers=su).json()["items"]]
     assert names.count("Uni Form") == 1 and names.count("fin co") == 1
 
 
@@ -169,7 +175,8 @@ def test_the_database_itself_refuses_a_duplicate_name(client, su):
 
 
 def test_renaming_onto_a_taken_name_is_a_409(client, su):
-    a, b = make_provider(client, su, "Nina Nunez"), make_provider(client, su, "Omar Oden")
+    a, b = make_provider(client, su, "Nina Nunez"), make_provider(
+        client, su, "Omar Oden")
     clash = client.patch(f"/v1/admin/providers/{a['id']}",
                          json={"full_name": b["full_name"]}, headers=su)
     assert clash.status_code == 409 and clash.json(
@@ -181,7 +188,8 @@ def test_renaming_onto_a_taken_name_is_a_409(client, su):
     assert client.patch(f"/v1/admin/providers/{a['id']}",
                         json={"full_name": "Nina N."}, headers=su).status_code == 200
     assert client.patch(f"/v1/admin/providers/{a['id']}",
-                        json={"full_name": "Nina Nunez"}, headers=su).status_code == 200  # its own name
+                        # its own name
+                        json={"full_name": "Nina Nunez"}, headers=su).status_code == 200
 
 
 # ------------------------------------------------------------------ identity ----
@@ -301,20 +309,21 @@ def test_with_no_superuser_key_authentication_is_off_and_everyone_is_the_superus
     assert result.stdout.split() == ["superuser", "200"]
 
 
-def test_providers_configs_and_keys_survive_a_restart(tmp_path):
+def test_providers_projects_configs_and_keys_survive_a_restart(tmp_path):
     k = "k" * 32
     first = BOOT + (
         "    h = {'X-API-Key': '%s'}\n"
         "    p = c.post('/v1/admin/providers', json={'full_name': 'Gus'}, headers=h).json()\n"
         "    ph = {'X-API-Key': p['api_key']}\n"
+        "    proj = c.post('/v1/projects', json={'name': 'vault', 'is_only_me': True}, headers=ph).json()\n"
         "    cfg = {'entity': 'things', 'fields': {'id': {'type': 'uuid', 'primary_key': True}, 'label': {'type': 'string'}},\n"
-        "           'seed': {'initial_count': 4}, 'is_only_me': True}\n"
-        "    made = c.post('/v1/configs', json=cfg, headers=ph).json()\n"
-        "    print(p['api_key'], made['id'], made['seeded_rows'])\n"
+        "           'seed': {'initial_count': 4}}\n"
+        "    made = c.post('/v1/projects/' + proj['id'] + '/configs', json=cfg, headers=ph).json()\n"
+        "    print(p['api_key'], made['id'], made['seeded_rows'], proj['id'])\n"
     ) % k
     out = run_app(tmp_path, first, API_KEY=k)
     assert out.returncode == 0, out.stderr
-    key, config_id, seeded = out.stdout.split()
+    key, config_id, seeded, project_id = out.stdout.split()
     assert seeded == "4"
 
     second = BOOT + (
@@ -325,12 +334,17 @@ def test_providers_configs_and_keys_survive_a_restart(tmp_path):
         "    from app import main\n"
         "    from app.services.catalog import catalog\n"
         "    job = main._scheduler.get_job('job_' + catalog.entries['%s'].physical) is not None\n"
-        "    print(me['full_name'], me['configs_owned'], len(rows), nobody, job)\n"
-    ) % (key, config_id, config_id, config_id)
+        "    proj = c.get('/v1/projects/%s', headers=ph).json()\n"
+        "    stranger = c.get('/v1/projects/%s', headers={'X-API-Key': 'k' * 32}).json()\n"
+        "    print(me['full_name'], me['projects_owned'], me['configs_owned'], len(rows), nobody, job,\n"
+        "          proj['is_only_me'], proj['config_count'], stranger['name'])\n"
+    ) % (key, config_id, config_id, config_id, project_id, project_id)
     again = run_app(tmp_path, second, API_KEY=k)
     assert again.returncode == 0, again.stderr
-    # name, configs owned, rows intact, the superuser key can still read it, its scheduler job was re-registered
-    assert again.stdout.split() == ["Gus", "1", "4", "200", "True"]
+    # name, projects and configs owned, rows intact, the superuser key can still read it, its scheduler
+    # job was re-registered, and the project is still private with its one config
+    assert again.stdout.split() == [
+        "Gus", "1", "1", "4", "200", "True", "True", "1", "vault"]
 
 
 def test_cli_create_provider_prints_a_working_key_once(tmp_path):

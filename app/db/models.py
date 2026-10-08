@@ -137,7 +137,8 @@ registry_providers = Table(
     Column("is_system", Boolean, nullable=False, default=False),
     Column("created_at", DateTime, nullable=False),
 )
-Index("uq_registry_providers_name_key", registry_providers.c.name_key, unique=True)
+Index("uq_registry_providers_name_key",
+      registry_providers.c.name_key, unique=True)
 
 # Only a SHA-256 of each key is stored; the key itself is shown once, at creation.
 registry_api_keys = Table(
@@ -155,21 +156,44 @@ registry_api_keys = Table(
 )
 
 
+# A project is a schema: a named group of configs (tables) that belong together. Refs
+# between configs resolve inside one project, visibility (`is_only_me`) is decided per
+# project, and a whole project exports as one schema (DDL + data).
+registry_projects = Table(
+    "registry_projects",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("provider_id", String, ForeignKey(
+        "registry_providers.id"), nullable=False, index=True),
+    Column("name", String, nullable=False),
+    Column("description", String),
+    Column("is_only_me", Boolean, nullable=False, default=False),
+    # "api" for projects providers create, "yaml" for the built-in examples project
+    Column("source", String, nullable=False, default="api"),
+    Column("created_at", DateTime, nullable=False),
+    Column("updated_at", DateTime, nullable=False),
+    UniqueConstraint("provider_id", "name",
+                     name="uq_registry_projects_provider_name"),
+)
+
 registry_configs = Table(
     "registry_configs",
     metadata,
     Column("id", String, primary_key=True),
     Column("provider_id", String, ForeignKey(
         "registry_providers.id"), nullable=False, index=True),
+    Column("project_id", String, ForeignKey(
+        "registry_projects.id"), nullable=False, index=True),
     Column("name", String, nullable=False),
     Column("physical_name", String, nullable=False, unique=True),
     Column("config_json", Text, nullable=False),
-    Column("is_only_me", Boolean, nullable=False, default=False),
     Column("source", String, nullable=False),
     Column("created_at", DateTime, nullable=False),
     Column("updated_at", DateTime, nullable=False),
-    UniqueConstraint("provider_id", "name",
-                     name="uq_registry_configs_provider_name"),
+    # A config name is unique inside its project (two projects may both have `orders`).
+    UniqueConstraint("project_id", "name",
+                     name="uq_registry_configs_project_name"),
 )
 
-REGISTRY_TABLES = [registry_providers, registry_api_keys, registry_configs]
+REGISTRY_TABLES = [registry_providers, registry_api_keys,
+                   registry_projects, registry_configs]
