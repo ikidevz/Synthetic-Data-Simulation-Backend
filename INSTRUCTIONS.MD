@@ -1,12 +1,14 @@
 # INSTRUCTIONS — Hands-on Test Guide for the Synthetic Data Simulation Backend
 
-A step-by-step manual for a **human tester** to exercise every feature of the backend: API keys, superuser vs provider privileges, publishing configs (YAML / JSON over the API), CRUD, change feed, batch generation, simulation, the scheduler, failure injection, exports, DDL, metrics, sharing/isolation, the CLI, and the error envelope.
+A step-by-step manual for a **human tester** to exercise every feature of the backend: API keys, superuser vs provider privileges, **projects (schemas)**, publishing configs (tables) into them (YAML / JSON over the API), CRUD, change feed, batch generation, simulation, the scheduler, failure injection, exports, DDL, metrics, sharing/isolation, the CLI, and the error envelope.
 
 Everything here was derived from the source code and README. Where something is _my reading of the code_ rather than something the README states, it is marked **(observed in code)**.
 
 **All interactive examples below use Python (`requests`) instead of curl/bash.**
 
-**Every step that creates state is written to be re-runnable (idempotent).** Run the guide top to bottom, stop half-way, run it again tomorrow against the same database — providers, keys and configs are found and reused instead of failing with `409 already_exists`. How that works, and how to start over, is in [0.2](#02-idempotent-run-process).
+**The data model is `provider → project (a schema) → config (a table) → rows`.** A *project* groups the configs that belong together; `ref` fields, bulk refresh, visibility (`is_only_me`) and whole-schema export all work at the project level. [5.0](#50-projects-the-schema-that-holds-your-configs) introduces it; the built-in `configs/*.yaml` examples are one read-only project called `examples`.
+
+**Every step that creates state is written to be re-runnable (idempotent).** Run the guide top to bottom, stop half-way, run it again tomorrow against the same database — providers, keys, projects and configs are found and reused instead of failing with `409 already_exists`. How that works, and how to start over, is in [0.2](#02-idempotent-run-process).
 
 ---
 
@@ -18,9 +20,9 @@ get back. Work through it in order the first time; afterwards, jump straight to
 the one section you need.
 
 **Set up the shared helpers first.** [0. Before you start](#0-before-you-start)
-defines `pv`, `su`, `st`, `pp` and the `BASE` / `SU` / `KEY` / `KEY2` / `CID` /
+defines `pv`, `su`, `st`, `pp` and the `BASE` / `SU` / `KEY` / `KEY2` / `PRJ` / `PRJ2` / `CID` /
 `OID` placeholders, plus the idempotent helpers (`ensure_provider`,
-`ensure_config`, `ensure_row`, `baseline_data`, `teardown`). Every snippet from
+`ensure_project`, `ensure_config`, `ensure_row`, `baseline_data`, `teardown`). Every snippet from
 Part 2 onward assumes they exist, so do not skip it. [0.2](#02-idempotent-run-process)
 explains the re-run contract.
 
@@ -30,6 +32,7 @@ explains the re-run contract.
 |---|---|
 | A **new tester**, first pass | 0 → Quick start → 1 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 21 |
 | Testing **permissions / multi-tenancy** | 2 (roles) → 3 (auth) → 4 (keys) → 15 (isolation) → 16 (legacy) |
+| Testing **projects (schemas)** | 5.0 → 5.13 → 8.6 → 12.3 → 13 → 15 |
 | Testing **data generation** | 5 (configs) → 8 (batch) → 9 (simulate) → 10 (scheduler) → 11 (failures) |
 | Testing **export / DDL / metrics** | 12 (export) → 13 (DDL) → 14 (metrics) |
 | An **operator** (deploy, Docker, CI) | 1 (install) → 17 (CLI) → 19 (Postgres/Docker/pytest) → 20 (smoke test) |
@@ -42,9 +45,9 @@ explains the re-run contract.
 |---|---|---|
 | 1 | 0, Quick start | Tools, placeholders, shared idempotent helpers, the re-run contract (0.2); then the five-minute path |
 | 2 | 1–4 | Install & env vars, roles, authentication, providers and API keys |
-| 3 | 5 | Configs: anatomy, validation, publish, edit, delete, dependencies |
+| 3 | 5 | Projects (schemas) and configs (tables): create, anatomy, validation, publish, edit, delete, dependencies, project lifecycle |
 | 4 | 6–11 | Rows: CRUD, change feed, batch, simulate, scheduler, failure injection |
-| 5 | 12–14 | Snapshot / delta / zip export, DDL export, metrics and job runs |
+| 5 | 12–14 | Snapshot / delta / zip export (per config, per project), DDL export (a whole schema), metrics and job runs |
 | 6 | 15–16 | Sharing & isolation between providers; superuser-only legacy routes |
 | 7 | 17–20 | CLI, error envelope reference, restart / PostgreSQL / Docker / pytest, one-shot smoke test |
 | 8 | 21, 22 | Master checklist, gotchas |
@@ -57,7 +60,7 @@ explains the re-run contract.
 - `pp(...)` pretty-prints; `pv` / `su` / `st` are thin wrappers over `requests`.
 - Section numbers are stable — `§5.7` always means subsection 5.7 wherever you see it.
 - A `#` at the start of a line inside a snippet is a comment, not a step to run.
-- `ensure_*`, `drop_config` and `baseline_data` are the **idempotent** building blocks ([0.2](#02-idempotent-run-process)). A step marked **(append-only)** adds data every time it runs; run `baseline_data(...)` to put the data back.
+- `ensure_*`, `drop_config`, `drop_project` and `baseline_data` are the **idempotent** building blocks ([0.2](#02-idempotent-run-process)). A step marked **(append-only)** adds data every time it runs; run `baseline_data(...)` to put the data back.
 
 ---
 
@@ -75,9 +78,9 @@ explains the re-run contract.
   - [3. Authentication tests](#3-authentication-tests)
   - [4. Provider & API-key management (superuser)](#4-provider--api-key-management-superuser)
 
-**Part 3 — Configs (the core object)**
+**Part 3 — Projects (schemas) and configs (tables)**
 
-  - [5. Configs: create, validate, list, edit, delete](#5-configs-create-validate-list-edit-delete)
+  - [5. Projects & configs: create, validate, list, edit, delete](#5-projects--configs-create-validate-list-edit-delete)
 
 **Part 4 — Working with the generated rows**
 
@@ -117,10 +120,10 @@ explains the re-run contract.
 
 **Tools:** Python 3.10+, `requests`. Optional: `sqlite3` CLI, `psql`, a zip library (stdlib `zipfile`). You can still use the Swagger UI (see [3.4](#34-swagger-ui-authorize-button)).
 
-**Placeholders:** `<like-this>` means "replace me". `BASE`, `SU`, `KEY`, `KEY2`, `CID`, `OID` (plus `A_ID`, `B_ID`, `TID`, `SID`) are variables used throughout.
+**Placeholders:** `<like-this>` means "replace me". `BASE`, `SU`, `KEY`, `KEY2`, `PRJ`, `PRJ2`, `CID`, `OID` (plus `A_ID`, `B_ID`, `TID`, `SID`) are variables used throughout. `PRJ` / `PRJ2` are Alice's and Bob's guide **project** ids.
 
 **Paste this helper block once** — it keeps every later example short, and it holds the
-idempotent layer (`ensure_*`, `drop_config`, `baseline_data`, `teardown`). The superuser key is read from the
+idempotent layer (`ensure_*`, `drop_config`, `drop_project`, `baseline_data`, `teardown`). The superuser key is read from the
 `API_KEY` (or `SU`) environment variable — export it before starting Jupyter, or edit `SU` by hand.
 
 ```python
@@ -138,6 +141,7 @@ STATE_FILE = Path(os.environ.get("STATE_FILE", ".synthetic_state.json"))  # hold
 
 KEY = KEY2 = None                  # provider A / B keys, filled by ensure_provider()
 A_ID = B_ID = None
+PRJ = PRJ2 = None                  # provider A / B guide project ids, filled by ensure_project()
 CID = OID = TID = None             # acme_customers / acme_orders / acme_tickets config ids
 
 JSON = {"Content-Type": "application/json"}
@@ -271,35 +275,97 @@ def _entity_name(body: Any) -> str:
     return m.group(1)
 
 
-def find_config(key: str, name: str) -> Optional[dict]:
-    items = requests.get(f"{BASE}/v1/configs", headers=_headers(key), params={"scope": "mine"}).json()["items"]
+# A project is a schema: a named group of configs (tables). Every config is published INTO one.
+GUIDE_PROJECT = "guide_lab"     # the project each provider's guide configs live in
+_default_projects: dict = {}    # api key -> id of that provider's GUIDE_PROJECT (cached, re-checked before use)
+
+
+def find_project(key: str, name: str) -> Optional[dict]:
+    """One of `key`'s OWN projects, by name (None if there is none)."""
+    items = requests.get(f"{BASE}/v1/projects", headers=_headers(key), params={"scope": "mine"}).json()["items"]
     return next((i for i in items if i["name"] == name), None)
 
 
-def ensure_config(key: str, body: Any, *, params: Optional[dict] = None,
-                  owner_key: Optional[str] = None) -> Tuple[str, bool]:
-    """Publish a config only if its name is free. Returns (config_id, created).
+def ensure_project(key: str, name: str, *, description: Optional[str] = None, is_only_me: Optional[bool] = None,
+                   params: Optional[dict] = None, owner_key: Optional[str] = None) -> Tuple[str, bool]:
+    """Create a project only if its name is free. Returns (project_id, created).
 
-    body: a dict (sent as JSON) or YAML text. Existing configs are NEVER modified or re-seeded
-    (that would be destructive); use PATCH ... ?confirm=true on purpose if you want that.
-    owner_key: whose configs to search when a superuser publishes for someone else (?provider_id=).
+    An existing project is NEVER edited (description / is_only_me are used only on creation; use PATCH on
+    purpose, see 5.13). `?on_exists=reuse` makes the POST itself safe too, so two runs racing each other
+    still end with ONE project. owner_key: whose projects to search when a superuser creates one for
+    someone else (?provider_id=).
     """
+    existing = find_project(owner_key or key, name)
+    if existing:
+        return existing["id"], False
+    body = {"name": name}
+    if description is not None:
+        body["description"] = description
+    if is_only_me is not None:
+        body["is_only_me"] = is_only_me
+    r = requests.post(f"{BASE}/v1/projects", headers=_headers(key, JSON), json=body,
+                      params={**(params or {}), "on_exists": "reuse"})
+    r.raise_for_status()
+    return r.json()["id"], bool(r.json().get("created", True))
+
+
+def default_project(key: str) -> str:
+    """The id of this provider's GUIDE_PROJECT, created on first use. The cached id is re-checked, so a
+    teardown() (which deletes the project) never leaves a stale id behind."""
+    pid = _default_projects.get(key)
+    if pid and requests.get(f"{BASE}/v1/projects/{pid}", headers=_headers(key)).status_code == 200:
+        return pid
+    pid, _ = ensure_project(key, GUIDE_PROJECT, description="hands-on guide")
+    _default_projects[key] = pid
+    return pid
+
+
+def drop_project(key: str, name: str) -> bool:
+    """Delete one of this provider's projects by name AND every config in it (the server deletes children
+    first). True if it existed. Deleting a project that is already gone is simply a no-op."""
+    project = find_project(key, name)
+    if not project:
+        return False
+    requests.delete(f"{BASE}/v1/projects/{project['id']}", headers=_headers(key),
+                    params={"confirm": "true"}).raise_for_status()
+    _default_projects.pop(key, None)
+    return True
+
+
+def find_config(key: str, name: str, project: Optional[str] = None) -> Optional[dict]:
+    """One of `key`'s configs by name, inside `project` (a project id; default: the guide project)."""
+    params = {"scope": "mine", "project_id": project or default_project(key)}
+    items = requests.get(f"{BASE}/v1/configs", headers=_headers(key), params=params).json()["items"]
+    return next((i for i in items if i["name"] == name), None)
+
+
+def ensure_config(key: str, body: Any, *, project: Optional[str] = None,
+                  owner_key: Optional[str] = None) -> Tuple[str, bool]:
+    """Publish a config into a project only if its name is free THERE. Returns (config_id, created).
+
+    body: a dict (sent as JSON) or YAML text. project: a project id (default: this provider's guide
+    project). Existing configs are NEVER modified or re-seeded (that would be destructive); use
+    PATCH ... ?confirm=true on purpose if you want that.
+    owner_key: whose configs to search when a superuser publishes into someone else's project.
+    """
+    project = project or default_project(key)
     name = _entity_name(body)
     lookup = owner_key or key
-    existing = find_config(lookup, name)
+    existing = find_config(lookup, name, project)
     if existing:
         return existing["id"], False
     kwargs = {"json": body, "headers": JSON} if isinstance(body, dict) else {"data": body, "headers": YAML}
-    r = requests.post(f"{BASE}/v1/configs", headers=_headers(key, kwargs.pop("headers")), params=params, **kwargs)
+    r = requests.post(f"{BASE}/v1/projects/{project}/configs", headers=_headers(key, kwargs.pop("headers")), **kwargs)
     if r.status_code == 409 and r.json().get("error", {}).get("code") == "already_exists":
-        return find_config(lookup, name)["id"], False       # lost a race with another run
+        return find_config(lookup, name, project)["id"], False       # lost a race with another run
     r.raise_for_status()
     return r.json()["id"], True
 
 
-def drop_config(key: str, name: str) -> bool:
-    """Delete a config by name if it exists (children must be dropped first). True if deleted."""
-    cfg = find_config(key, name)
+def drop_config(key: str, name: str, project: Optional[str] = None) -> bool:
+    """Delete a config by name if it exists (children must be dropped first). True if deleted.
+    To remove a whole project's worth at once, use drop_project() instead."""
+    cfg = find_config(key, name, project)
     if not cfg:
         return False
     r = requests.delete(f"{BASE}/v1/configs/{cfg['id']}", headers=_headers(key), params={"confirm": "true"})
@@ -340,26 +406,28 @@ def baseline_data(key: str, config_id: str, seed: int = 42, count: Optional[int]
 
 
 # ------------------------------------------------------------ guide-only extras ----
-# Everything this guide creates, CHILDREN BEFORE PARENTS (a referenced config cannot be deleted).
-GUIDE_CONFIGS = ["starved_child", "empty_parent", "b_child", "b_parent", "acme_tickets", "acme_orders",
-                 "acme_customers", "scratch", "shared_name", "bobs_things", "seed_a", "seed_b", "restart_probe"]
+# Every PROJECT this guide creates. Deleting a project deletes all of its configs (children first, on the
+# server), so there is no per-config list to keep in order any more.
+GUIDE_PROJECTS = [GUIDE_PROJECT, "guide_private", "guide_scratch", "guide_other", "guide_batch"]
 
 
-def teardown() -> None:
-    """Delete every config the guide created, for both providers. Providers cannot be deleted (no route)."""
-    for key in filter(None, (KEY, KEY2)):
-        for name in GUIDE_CONFIGS:
+def teardown(*extra_keys: str) -> None:
+    """Delete every project the guide created (and with it every config and row), for both providers plus
+    any `extra_keys` (e.g. the Restart Test provider). Providers cannot be deleted (no route)."""
+    for key in filter(None, (KEY, KEY2, *extra_keys)):
+        for name in GUIDE_PROJECTS:
             try:
-                if drop_config(key, name):
-                    print("dropped", name)
+                if drop_project(key, name):
+                    print("dropped project", name)
             except requests.HTTPError as exc:
-                print("could not drop", name, "-", exc.response.json().get("error"))
+                print("could not drop project", name, "-", exc.response.json().get("error"))
+    _default_projects.clear()
 ```
 
 Usage pattern:
 
 ```python
-r = pv("POST", "/v1/configs", headers=YAML, data=Path("file.yaml").read_text())
+r = pv("POST", f"/v1/projects/{PRJ}/configs", headers=YAML, data=Path("file.yaml").read_text())
 pp(r.json())
 st("GET", "/v1/me", key=KEY)   # prints status only
 ```
@@ -383,12 +451,13 @@ st("GET", "/v1/me", key=KEY)   # prints status only
 | --- | --- | --- |
 | **Providers** | a second provider with the same name (older builds), or `409 already_exists` | `ensure_provider(name)` finds the provider (by the saved id, else by normalised name), reactivates it if needed, and returns a working key |
 | **Provider keys** (secret shown **once**) | the secret can never be read back | the key is saved in `.synthetic_state.json` (mode 600 — **git-ignore it**). Lost or revoked → exactly **one** new key is issued, never a pile |
-| **Configs** | `409 already_exists` on the second publish | `ensure_config(key, body)` publishes only if the name is free and **never edits or re-seeds** an existing config (that is destructive and has its own step, §5.7) |
+| **Projects** | `409 already_exists` on the second create | `ensure_project(key, name)` finds the project by name (and POSTs with `?on_exists=reuse`, so even a racing second run ends with one). It **never edits** an existing project (§5.13 does that on purpose) |
+| **Configs** | `409 already_exists` on the second publish | `ensure_config(key, body)` publishes into a project only if the name is free **there** and **never edits or re-seeds** an existing config (that is destructive and has its own step, §5.7) |
 | **Rows you choose** | duplicate rows | `ensure_row(key, config_id, {match})` — a caller cannot choose a primary key, so a field you control is the row's identity |
 | **Generated rows** | the table grows on every run | `baseline_data(key, config_id, seed=42)` = `replace` + fixed seed → the same ids and values every time (dependents come along) |
 | **Seeded appends** | `409 duplicate_primary_key` the second time | same seed + same request = same ids, so the 409 *is* the guard — treat it as "already done" |
-| **Switches** (`is_only_me`, `fail_rate`, deactivate, rename, cadence) | a crash leaves the system in the odd state | wrapped in `try/finally`, so the restore always runs |
-| **Destructive steps** (`reset`, `PATCH fields`, `DELETE`) | — | idempotent by nature: they converge to the same end state; deleting something already gone is a `404`, which is fine |
+| **Switches** (a project's `is_only_me`, `fail_rate`, deactivate, rename, cadence) | a crash leaves the system in the odd state | wrapped in `try/finally`, so the restore always runs |
+| **Destructive steps** (`reset`, `PATCH fields`, `DELETE` a config or a project) | — | idempotent by nature: they converge to the same end state; deleting something already gone is a `404`, which is fine |
 
 **First cell of every session** (safe to repeat; §4.1 makes the same calls):
 
@@ -397,25 +466,28 @@ alice = ensure_provider("Alice Almeida")
 KEY, A_ID, A_KEYID = alice["api_key"], alice["id"], alice["key_id"]
 bob = ensure_provider("Bob Bautista")
 KEY2, B_ID = bob["api_key"], bob["id"]
+PRJ, a_new = ensure_project(KEY, GUIDE_PROJECT, description="hands-on guide")    # each provider's schema
+PRJ2, b_new = ensure_project(KEY2, GUIDE_PROJECT, description="hands-on guide")
 print("Alice", A_ID, "created" if alice["created"] else "reused", "| Bob", B_ID, "created" if bob["created"] else "reused")
+print("projects:", PRJ, "created" if a_new else "reused", "|", PRJ2, "created" if b_new else "reused")
 ```
 
 **Start over / clean up**
 
 ```python
-teardown()                                # drop every config the guide made (children first)
+teardown()                                # drop every guide PROJECT, and with it every config and row
 STATE_FILE.unlink(missing_ok=True)        # forget saved keys; providers stay, the next run issues one fresh key each
 ```
 
-Providers have no delete route, so they can only be deactivated. For a truly pristine start, stop the server, delete `synthetic.db` (and `.synthetic_state.json`), start again.
+Providers have no delete route, so they can only be deactivated. (A provider's projects *can* be deleted — that is how `teardown()` works.) For a truly pristine start, stop the server, delete `synthetic.db` (and `.synthetic_state.json`), start again.
 
-**Why not just `?on_exists=reuse`?** It returns the existing provider but **no key** (only a hash is kept), and not every build has it. `ensure_provider` works either way: it never relies on the server refusing a duplicate.
+**Why not just `?on_exists=reuse`?** For *providers* it returns the existing provider but **no key** (only a hash is kept), and not every build has it, so `ensure_provider` never relies on it. For *projects* it is exactly what you want (a project has no secret), and `ensure_project` uses it **and** looks the project up first, so it works on a server without it too.
 
 ---
 
 ### Quick start (5 minutes)
 
-The shortest path from nothing to "I created an API key, published a YAML config and read generated data". Paste the [§0 helper block](#0-before-you-start) first; every step below is safe to repeat.
+The shortest path from nothing to "I created an API key and a project, published a YAML config into it and read generated data". Paste the [§0 helper block](#0-before-you-start) first; every step below is safe to repeat.
 
 ```python
 # 1. Install (run once in a terminal)
@@ -426,7 +498,9 @@ The shortest path from nothing to "I created an API key, published a YAML config
 # 2. Make (or reuse) the SUPERUSER key and start the server (terminal)
 #    export API_KEY=${API_KEY:-$(python -m app.cli genkey)}   # keeps the key you already have
 #    echo "$API_KEY"                                          # keep it
-#    uvicorn app.main:app --reload
+#    MAX_PROJECTS_PER_PROVIDER=10 MAX_CONFIGS_PER_PROVIDER=40 uvicorn app.main:app --reload
+#    (raise the quotas for this guide: it makes 5 projects and ~12 configs per provider; the defaults are 3 and 10.
+#     §5.11 shows the quota errors on a separate throwaway server.)
 #    The §0 helper block reads this key from the API_KEY environment variable (SU).
 
 # 3. Find-or-create the PROVIDER and its API key.
@@ -435,12 +509,16 @@ provider = ensure_provider("Acme Data Team")
 KEY = provider["api_key"]
 print(json.dumps({**provider, "api_key": KEY[:8] + "…"}, indent=2))
 
-# 4. Publish a config (YAML straight from the configs/ folder) — only if the name is still free
+# 4. Find-or-create a PROJECT (a schema) to hold your tables
+PRJ, created = ensure_project(KEY, "acme", description="Acme demo domain")
+print("project", PRJ, "created" if created else "already there - reused")
+
+# 5. Publish a config (YAML straight from the configs/ folder) into it — only if the name is still free there
 yaml_body = Path("configs/customers.yaml").read_text()
-CID, created = ensure_config(KEY, yaml_body)
+CID, created = ensure_config(KEY, yaml_body, project=PRJ)
 print("published" if created else "already published - reused", CID)
 
-# 5. Read the generated data and its change feed
+# 6. Read the generated data and its change feed
 data = pv("GET", f"/v1/configs/{CID}/data", params={"limit": 5}).json()
 print(json.dumps(data, indent=2))
 
@@ -448,7 +526,7 @@ changes = pv("GET", f"/v1/configs/{CID}/changes", params={"since": 0, "limit": 5
 print(json.dumps(changes, indent=2))
 ```
 
-If step 4 printed `published` the config was just created and seeded with 30 rows (the POST response says `"seeded_rows": 30`); on a re-run it prints `already published - reused` and nothing changes. Either way, step 5 should show rows — you are done with the basics. The rest of this document tests everything else.
+If step 5 printed `published` the config was just created and seeded with 30 rows (the POST response says `"seeded_rows": 30`); on a re-run it prints `already published - reused` and nothing changes. Either way, step 6 should show rows — you are done with the basics. The rest of this document tests everything else.
 
 ---
 
@@ -474,7 +552,8 @@ os.environ["API_KEY"] = key
 print("SUPERUSER KEY:", key)
 
 # Then start the server in a separate process/terminal:
-#   uvicorn app.main:app --reload
+#   MAX_PROJECTS_PER_PROVIDER=10 MAX_CONFIGS_PER_PROVIDER=40 uvicorn app.main:app --reload
+#   (the guide uses 5 projects and ~12 configs per provider; the default quotas are 3 and 10)
 ```
 
 > **`.env` gotcha:** the app itself does **not** read `.env` (no dotenv code in `app/`). `cp .env.example .env` only helps if you load it: either `export` the variables, or start with `uvicorn app.main:app --env-file .env` (uvicorn's `[standard]` extra includes python-dotenv). `docker compose` _does_ read `.env` for `${API_KEY}`.
@@ -503,8 +582,10 @@ pp(r.json())                                # row_count 30 / 50 / 20
 | `REQUIRE_API_KEY`          | off                        | `true` → refuse to start without a key                                                                                                  |
 | `ENABLE_DOCS`              | `true`                     | `false` → `/docs`, `/redoc`, `/openapi.json` return 404                                                                                 |
 | `DATABASE_URL`             | `sqlite:///./synthetic.db` | e.g. `postgresql+psycopg2://user:pw@host:5432/db`                                                                                       |
-| `CONFIG_DIR`               | `./configs`                | folder of built-in YAML entities                                                                                                        |
-| `MAX_CONFIGS_PER_PROVIDER` | `10`                       | configs a provider can hold                                                                                                             |
+| `CONFIG_DIR`               | `./configs`                | folder of built-in YAML entities (the `examples` project). The shipped files are examples; the tests point this at their own folder       |
+| `MAX_PROJECTS_PER_PROVIDER` | `3`                       | projects (schemas) a provider can hold                                                                                                  |
+| `MAX_CONFIGS_PER_PROJECT`  | `10`                       | configs (tables) in one project                                                                                                         |
+| `MAX_CONFIGS_PER_PROVIDER` | `10`                       | configs across **all** of a provider's projects (the storage ceiling)                                                                   |
 | `MAX_FIELDS_PER_CONFIG`    | `40`                       | fields per config                                                                                                                       |
 | `MAX_INITIAL_COUNT`        | `10000`                    | `seed.initial_count`                                                                                                                    |
 | `MAX_ROWS_PER_CONFIG`      | `50000`                    | total rows per config (soft-deleted included)                                                                                           |
@@ -529,13 +610,13 @@ There are three kinds of caller.
 | Capability                                                                                                                                                  |           Superuser           |  Provider (owner)   |             Provider (not owner)             |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------: | :-----------------: | :------------------------------------------: |
 | Create/list/rename/deactivate providers, issue/revoke keys (`/v1/admin/*`)                                                                                  |              yes              |       **403**       |                   **403**                    |
-| Publish configs (`POST /v1/configs`)                                                                                                                        | yes (can add `?provider_id=`) | yes (for self only) |                      —                       |
-| Read a config, rows, changes, export, DDL, metrics                                                                                                          |   yes (all, incl. private)    |         yes         | yes — **unless `is_only_me`** (then **404**) |
-| Edit/delete config; add/update/delete rows; batch; simulate                                                                                                 |              yes              |         yes         |       **403** (or **404** if private)        |
+| Create projects (`POST /v1/projects`) and publish configs into them (`POST /v1/projects/{id}/configs`)                                                      | yes (can add `?provider_id=`) | yes (for self only) |        **403** (not their project)           |
+| Read a project, its configs, rows, changes, export, DDL, metrics                                                                                            |   yes (all, incl. private)    |         yes         | yes — **unless the project is `is_only_me`** (then **404**) |
+| Edit/delete a project or config; add/update/delete rows; batch; simulate                                                                                    |              yes              |         yes         |       **403** (or **404** if private)        |
 | Legacy routes: `/orders`, `/customers`, `/support_tickets`, `/entities`, `/metrics`, `/scheduler/runs`, `/ddl`, `/export`, `/admin/batch`, `/admin/changes` |              yes              |       **403**       |                   **403**                    |
 | `GET /health`                                                                                                                                               |              yes              |         yes         |           yes (**no key needed**)            |
 
-The built-in YAML entities are owned by a system provider (`prov_system`, ids `cfg_sys_customers`, `cfg_sys_orders`, `cfg_sys_support_tickets`). They are **public** (everyone can read) and **writable only by the superuser**.
+The built-in YAML entities are owned by a system provider (`prov_system`, ids `cfg_sys_customers`, `cfg_sys_orders`, `cfg_sys_support_tickets`) and live together in one read-only project, `examples` (`prj_system_examples`). They are **public** (everyone can read) and **writable only by the superuser**; nobody can add a config to that project, rename it or delete it through the API.
 
 ---
 
@@ -643,6 +724,10 @@ bob = ensure_provider("Bob Bautista")
 KEY2, B_ID = bob["api_key"], bob["id"]
 pp({"alice": {**alice, "api_key": KEY[:8] + "…"}, "bob": {**bob, "api_key": KEY2[:8] + "…"}})
 # First run: created=True for both. Re-run: created=False, same ids, nothing new is issued.
+
+# each provider's schema for the rest of the guide (see 5.0) — also find-or-create
+PRJ, _ = ensure_project(KEY, GUIDE_PROJECT, description="hands-on guide")
+PRJ2, _ = ensure_project(KEY2, GUIDE_PROJECT, description="hands-on guide")
 ```
 
 **Expect `201`** (first run only — a re-run reuses the provider and shows `created: False`) with: `id` (`prov_…`), `full_name`, `is_active: true`, `is_system: false`, `created: true`, `api_key` (the secret — **shown exactly once**), `key` (`id`, `key_prefix` = first 8 chars of the secret, `label: "initial"`), and a `note` telling you to store it now.
@@ -695,7 +780,7 @@ for body in (
 #### 4.3 Who am I? **[SU/P]**
 
 ```python
-pp(pv("GET", "/v1/me").json())   # role "provider", id, full_name, configs_owned, limits{...}
+pp(pv("GET", "/v1/me").json())   # role "provider", id, full_name, projects_owned, configs_owned, limits{...}
 pp(su("GET", "/v1/me").json())   # role "superuser", id null
 ```
 
@@ -799,17 +884,51 @@ print(hashlib.sha256(KEY.encode()).hexdigest())  # must match the full key_hash 
 
 ---
 
-## Part 3 — Configs (the core object)
+## Part 3 — Projects (schemas) and configs (tables)
 
-### 5. Configs: create, validate, list, edit, delete
+### 5. Projects & configs: create, validate, list, edit, delete
 
-A **config** describes one entity (a table + its generation rules + its update schedule). Publishing one creates a real table, seeds it, and registers a recurring background job. Nothing in Python changes.
+A **project** is a schema: a named group of configs that belong together. A **config** describes one entity — one table, its generation rules and its update schedule. Publishing a config *into a project* creates a real table, seeds it, and registers a recurring background job. Nothing in Python changes.
+
+```
+provider  →  project (a schema)  →  config (a table)  →  rows
+```
+
+#### 5.0 Projects: the schema that holds your configs
+
+| Rule | Behaviour |
+| --- | --- |
+| **`ref` scope** | a `ref` field can only point at a config in the **same project** (not another provider's, not even your own other project's) |
+| **Refresh scope** | `replace` / `reset` (which also refresh dependents) and a project batch reach only that project's tables |
+| **Names** | a config name is unique **per project**; a project name is unique **per provider** (`^[a-z][a-z0-9_]{0,31}$`, `schema` / `manifest` reserved) |
+| **Visibility** | `is_only_me` is a **project** setting and every config in it inherits it — there is **no** per-config switch, so a shared table can never point at a hidden parent |
+| **Schema export** | `GET /v1/projects/{id}/ddl` is the whole schema; on `dialect=postgresql` it starts with `CREATE SCHEMA IF NOT EXISTS <project>` and `SET search_path` (§13) |
+| **Zip export** | `GET /v1/projects/{id}/export` — schema + one data file per config + manifest (§12.3) |
+| **Table names** | unchanged: still `d_<10 hex>_<name>` internally; a project never renames a table or touches the change feed |
+| **Quotas** | `MAX_PROJECTS_PER_PROVIDER`, `MAX_CONFIGS_PER_PROJECT`, `MAX_CONFIGS_PER_PROVIDER` (a total across projects) — §5.11 |
+| **Built-in examples** | the `configs/*.yaml` entities are one read-only project, `examples` (`prj_system_examples`) |
+
+Create one (re-run safe — `?on_exists=reuse` returns the existing project instead of a `409`):
+
+```python
+PRJ, created = ensure_project(KEY, GUIDE_PROJECT, description="hands-on guide")   # the helper from §0
+print(PRJ, "created" if created else "reused")
+
+# the same thing by hand
+r = pv("POST", "/v1/projects", headers=JSON, params={"on_exists": "reuse"},
+       json={"name": GUIDE_PROJECT, "description": "hands-on guide"})
+pp(r.json())
+# first run: 201, "created": true · every re-run: 200, "created": false, the same id, nothing edited
+```
+
+**Expect** `201` (first run only): `id` (`prj_<12 hex>`), `name`, `description`, `owner{id,full_name}`, `is_only_me: false`, `source: "api"`, `can_write: true`, `config_count: 0`, `configs: []`, `created`, `created_at`, `updated_at`. A re-run with `?on_exists=reuse` answers **`200`** with `created: false` and **does not change** the description or visibility (use `PATCH`, §5.13). Without `on_exists`, a name you already hold is `409 already_exists` (the message points at `?on_exists=reuse`).
+
 
 #### 5.1 Anatomy of a config (annotated)
 
 ```yaml
 entity: acme_customers # or `name:`. 1-32 chars: ^[a-z][a-z0-9_]{0,31}$ ; "schema" and "manifest" are reserved
-is_only_me: false # false (default) = other providers may READ it; true = private (404 to everyone but owner/superuser)
+# (no is_only_me here: visibility is a PROJECT setting — a config inherits its project's)
 
 fields:
   customer_id: { type: uuid, primary_key: true } # exactly ONE pk, and it must be uuid
@@ -850,13 +969,13 @@ failure_injection:
 | `nullable`                                  | allows `null` on writes (always true for the soft-delete field)                                                                                                                  |
 | `min` / `max`                               | range for `int` / `float` generation (default 0–1000); `min > max` is rejected                                                                                                   |
 | `values`                                    | **enum only**: 1–50 distinct, non-empty strings, each ≤ 64 chars                                                                                                                 |
-| `ref_entity`                                | **ref only**: must be one of **your own** configs; no self-reference; no cycles                                                                                                  |
+| `ref_entity`                                | **ref only**: must be a config **in the same project**; no self-reference; no cycles                                                                                             |
 | `auto: created` / `updated` / `soft_delete` | need `type: timestamp`; only **one** `soft_delete` field allowed                                                                                                                 |
 | `auto: version`                             | field must be named `version`, `type: int`; it is auto-added if missing                                                                                                          |
 | `key_label`                                 | (≤ 64 chars) hand the field to **iki-data-generator** (e.g. `full_name`, `email_address`, `job_title`); the config is trial-generated at publish time so a bad label fails _now_ |
 | `ik_options`                                | passed through unchanged to Iki; **requires** `key_label`; ≤ 2000 bytes of JSON                                                                                                  |
 
-Other rules: field names `^[a-z][a-z0-9_]{0,39}$` · unknown keys anywhere are **rejected** (typos fail loudly) · YAML anchors/aliases are **rejected** · a config name is unique per provider (two providers may each have an `orders`).
+Other rules: field names `^[a-z][a-z0-9_]{0,39}$` · unknown keys anywhere are **rejected** (typos fail loudly) · YAML anchors/aliases are **rejected** · a config name is unique **per project** (two projects — of one provider or of two — may each have an `orders`) · `is_only_me` in a config body is rejected ("is_only_me is a project setting").
 `failure_injection.drift` is accepted by the parser but **has no effect** (schema-drift injection is listed as not implemented).
 
 #### 5.2 Save three example configs (a 3-level chain)
@@ -925,9 +1044,9 @@ Path("acme_tickets.yaml").write_text(ACME_TICKETS_YAML)
 | Way                                      | Who                   | How                                                      | Notes                                                                                                                                                                                                                                                                                                        |
 | ---------------------------------------- | --------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **A. Built-in YAML file**                | operator              | drop `configs/<name>.yaml`, **restart** the server       | owned by `prov_system`, id `cfg_sys_<name>`, public, **writable only by the superuser**, no row quota. Invalid refs/types/cycles fail at **startup**. Per-entity routes `/<name>` appear for the superuser. File configs are **not** checked for unknown keys the way API configs are **(observed in code)** |
-| **B. API — YAML body**                   | provider or superuser | `POST /v1/configs` with `Content-Type: text/yaml`        | a file from `configs/` posts as-is                                                                                                                                                                                                                                                                           |
-| **C. API — JSON body**                   | provider or superuser | `POST /v1/configs` with `Content-Type: application/json` | **expanded below with the full §5.2 chain in JSON**. Any content-type that isn't JSON (or `…+json`) is parsed as YAML (YAML ⊇ JSON)                                                                                                                                                                                                                                             |
-| **D. Superuser on behalf of a provider** | superuser             | `POST /v1/configs?provider_id=prov_…`                    | without `provider_id` the config is owned by the system provider                                                                                                                                                                                                                                             |
+| **B. API — YAML body**                   | provider or superuser | `POST /v1/projects/{id}/configs` with `Content-Type: text/yaml`        | a file from `configs/` posts as-is, **into a project you own** |
+| **C. API — JSON body**                   | provider or superuser | `POST /v1/projects/{id}/configs` with `Content-Type: application/json` | **expanded below with the full §5.2 chain in JSON**. Any content-type that isn't JSON (or `…+json`) is parsed as YAML (YAML ⊇ JSON) |
+| **D. Superuser on behalf of a provider** | superuser             | `POST /v1/projects?provider_id=prov_…`, then post configs into that project | the project (and every config in it) belongs to that provider; without `provider_id` the project is owned by the system provider |
 
 **C. API — JSON body, spelled out.** The same three configs from §5.2, converted to JSON. The document means the same thing — `parse_body()` runs `json.loads` for `application/json` (or any `…+json`) and hands the dict to the **same** validator, so unknown keys, quotas, `ref` resolution and seeding behave exactly as in §5.5.
 
@@ -993,12 +1112,12 @@ ACME_TICKETS = {
 }
 ```
 
-Publish them **parents first** — a `ref` must already name a config of yours, and that parent must already hold rows:
+Publish them **parents first** — a `ref` must already name a config **in the same project**, and that parent must already hold rows:
 
 ```python
 published = {}
 for cfg in (ACME_CUSTOMERS, ACME_ORDERS, ACME_TICKETS):
-    config_id, created = ensure_config(KEY, cfg)      # publishes only if the name is still free
+    config_id, created = ensure_config(KEY, cfg, project=PRJ)      # publishes into PRJ only if the name is still free there
     published[cfg["entity"]] = config_id
     info = pv("GET", f"/v1/configs/{config_id}").json()
     print(cfg["entity"], config_id, "source:", info["source"], "|", "created now" if created else "already there - reused")
@@ -1017,12 +1136,12 @@ TID = published["acme_tickets"]
 Path("acme_customers.json").write_text(json.dumps(ACME_CUSTOMERS, indent=2))
 
 # a) honest JSON
-r = pv("POST", "/v1/configs", headers=JSON, data=Path("acme_customers.json").read_text())
+r = pv("POST", f"/v1/projects/{PRJ}/configs", headers=JSON, data=Path("acme_customers.json").read_text())
 print(r.status_code)                       # 201 on a pristine database; 409 if the loop above already published it
 assert r.status_code in (201, 409)
 
 # b) the same JSON mislabelled as YAML — still fine, YAML is a superset of JSON
-r = pv("POST", "/v1/configs", headers=YAML, data=Path("acme_customers.json").read_text())
+r = pv("POST", f"/v1/projects/{PRJ}/configs", headers=YAML, data=Path("acme_customers.json").read_text())
 print(r.status_code)                       # 409 already_exists (posted in step a, or by the loop above)
 ```
 
@@ -1036,37 +1155,41 @@ Notes and traps specific to this route:
 | send a JSON array or a bare scalar                       | `422 invalid_config` "the config must be an object (a mapping of keys to values)"                    |
 | send non-UTF-8 bytes                                     | `422 invalid_config` "body must be UTF-8 text"                                                      |
 | exceed `MAX_BODY_BYTES`                                  | `413 payload_too_large` — checked before parsing **(observed in code)**                               |
-| re-publish an entity name you already hold               | `409 already_exists` — a config name is unique per provider                                          |
+| re-publish an entity name this project already holds     | `409 already_exists` — a config name is unique **per project**                                       |
+| publish into a project that is not yours                 | `403 forbidden` (readable if public, never writable); `404` if it is private                          |
+| publish into the built-in `examples` project             | `409 managed_by_yaml` — those configs come from files                                                |
 
-Nothing else changes: the JSON route shares the auto-added `version` field, `key_label` trial generation through iki-data-generator, unknown-key rejection, the `MAX_CONFIGS_PER_PROVIDER` / `MAX_FIELDS_PER_CONFIG` quotas, `is_only_me` privacy and the `?provider_id=` variant of way D with the YAML route. The only YAML-specific guard — rejecting anchors/aliases — lives in the YAML branch, so it simply has nothing to catch here. Continue with §5.4 to dry-run one of these, or §5.5 to publish the YAML files instead.
+Nothing else changes: the JSON route shares the auto-added `version` field, `key_label` trial generation through iki-data-generator, unknown-key rejection, the `MAX_CONFIGS_PER_PROJECT` / `MAX_CONFIGS_PER_PROVIDER` / `MAX_FIELDS_PER_CONFIG` quotas, the project's visibility and the project-on-behalf variant of way D with the YAML route. The only YAML-specific guard — rejecting anchors/aliases — lives in the YAML branch, so it simply has nothing to catch here. Continue with §5.4 to dry-run one of these, or §5.5 to publish the YAML files instead.
 
 
 
 #### 5.4 Dry-run validation (saves nothing) **[SU/P]**
 
 ```python
-r = pv("POST", "/v1/configs/validate", headers=YAML, data=Path("acme_customers.yaml").read_text())
+r = pv("POST", f"/v1/projects/{PRJ}/configs/validate", headers=YAML, data=Path("acme_customers.yaml").read_text())
 pp(r.json())
-# Expect 200: {"valid": true, "name_available": true, "is_only_me": false, "config": {…normalized, with version added…}}
+# Expect 200: {"valid": true, "project": {"id": "prj_…", "name": "guide_lab"}, "name_available": true,
+#              "config": {…normalized, with version added…}}
+# name_available is checked against THIS project's configs; after the first publish it turns false.
 ```
 
 #### 5.5 Publish **[SU/P]**
 
 ```python
-# parents first; each one is published only if its name is still free (re-run safe)
-CID, created = ensure_config(KEY, Path("acme_customers.yaml").read_text())
+# parents first, all into the same project; each one is published only if its name is still free there (re-run safe)
+CID, created = ensure_config(KEY, Path("acme_customers.yaml").read_text(), project=PRJ)
 c = pv("GET", f"/v1/configs/{CID}").json()
-pp({k: c[k] for k in ("id", "name", "owner", "is_only_me", "source", "can_write", "cadence", "seeded_rows") if k in c})
+pp({k: c[k] for k in ("id", "name", "project", "owner", "source", "can_write", "cadence", "seeded_rows") if k in c})
 print("customers:", "created" if created else "reused")
 
-OID, created = ensure_config(KEY, Path("acme_orders.yaml").read_text())
+OID, created = ensure_config(KEY, Path("acme_orders.yaml").read_text(), project=PRJ)
 print("orders:", "created" if created else "reused")
 
-TID, created = ensure_config(KEY, Path("acme_tickets.yaml").read_text())
+TID, created = ensure_config(KEY, Path("acme_tickets.yaml").read_text(), project=PRJ)
 print("tickets:", "created" if created else "reused")
 ```
 
-**Expect `201`** each on the first run (a re-run reuses the config and prints `reused`): `id` (`cfg_<16 hex>`), `name`, `owner{id,full_name}`, `is_only_me`, `source: "api"`, `can_write: true`, `cadence`, `fields[]`, `created_at`, `updated_at`, `config{…}`, and `seeded_rows` (25 / 40 / 15).
+**Expect `201`** each on the first run (a re-run reuses the config and prints `reused`): `id` (`cfg_<16 hex>`), `name`, `project{id,name,is_only_me}`, `owner{id,full_name}`, `source: "api"`, `can_write: true`, `cadence`, `fields[]`, `created_at`, `updated_at`, `config{…}`, and `seeded_rows` (25 / 40 / 15).
 
 Same thing as JSON:
 
@@ -1093,19 +1216,21 @@ for i in items:
 
 print("mine:", [i["name"] for i in pv("GET", "/v1/configs", params={"scope": "mine"}).json()["items"]])
 print("shared:", [i["name"] for i in pv("GET", "/v1/configs", params={"scope": "shared"}).json()["items"]])
+print("in my project:", [i["name"] for i in pv("GET", "/v1/configs", params={"project_id": PRJ}).json()["items"]])
+print("same, via the project:", [i["name"] for i in pv("GET", f"/v1/projects/{PRJ}/configs").json()["items"]])
 pp(pv("GET", f"/v1/configs/{CID}").json())   # full definition under "config"
 ```
 
-The list is a summary (no `config` key). `can_write` tells you whether _you_ may change it. `scope` other than `mine|shared|all` → `422`.
+The list is a summary (no `config` key); each item names its `project`. `can_write` tells you whether _you_ may change it. `scope` other than `mine|shared|all` → `422`. `project_id` narrows the list to one project (a project you can't read answers `404` on `/v1/projects/{id}/configs`).
 
 #### 5.7 Edit a config (`PATCH`) **[SU/P — owner]**
 
 | Key you may send                               | Behaviour                                                                                                                                                                                                |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `is_only_me`                                   | toggles privacy; nothing else changes                                                                                                                                                                    |
 | `seed`, `update_schedule`, `failure_injection` | each is **merged** into the existing object; takes effect **immediately** and the background job is **rescheduled**                                                                                      |
 | `fields`                                       | **replaced wholesale** (not merged!). Drops the table, **deletes all data**, restarts the change feed at version 1 and re-seeds. Needs `?confirm=true`; refused while another config references this one |
 | `name` / `entity`                              | **cannot change** (delete and recreate)                                                                                                                                                                  |
+| `is_only_me`                                   | **not a config setting** — `422` with a pointer to `PATCH /v1/projects/{project_id}` (§5.13)                                                                                                             |
 
 ```python
 # merge schedule + failure settings
@@ -1123,9 +1248,9 @@ pv("PATCH", f"/v1/configs/{CID}", headers=JSON, json={
     "failure_injection": {"latency_ms": 0},
 })
 
-# privacy toggle
-print(pv("PATCH", f"/v1/configs/{CID}", headers=JSON, json={"is_only_me": True}).json()["is_only_me"])
-print(pv("PATCH", f"/v1/configs/{CID}", headers=JSON, json={"is_only_me": False}).json()["is_only_me"])
+# privacy is the PROJECT's: a config refuses the switch and says where it lives
+r = pv("PATCH", f"/v1/configs/{CID}", headers=JSON, json={"is_only_me": True})
+print(r.status_code, r.json()["error"]["message"])   # 422 … is_only_me belongs to the project: PATCH /v1/projects/{project_id}.
 
 # seed.initial_count alone does NOT add rows; it sets the default for batch/re-seed
 pp(pv("PATCH", f"/v1/configs/{SID}", headers=JSON, json={"seed": {"initial_count": 8}}).json())
@@ -1162,7 +1287,7 @@ cases = [
     {"name": "renamed"},
     {"entity": "renamed"},
     {"nope": 1},
-    {"is_only_me": "yes"},
+    {"is_only_me": True},          # belongs to the project (422, with a hint)
     {"seed": "x"},
     {"failure_injection": {"fail_rate": 3}},
 ]
@@ -1177,9 +1302,13 @@ for body in cases:
 r = su("PATCH", "/v1/configs/cfg_sys_orders", headers=JSON, json={"failure_injection": {"latency_ms": 1}})
 print(r.status_code, r.json().get("error"))   # 409 managed_by_yaml
 
-r = su("PATCH", "/v1/configs/cfg_sys_support_tickets", headers=JSON, json={"is_only_me": True})
-print(r.json()["is_only_me"])   # allowed
-su("PATCH", "/v1/configs/cfg_sys_support_tickets", headers=JSON, json={"is_only_me": False})
+# the project that holds them can be hidden and shown again (superuser) — but not renamed or deleted
+r = su("PATCH", "/v1/projects/prj_system_examples", headers=JSON, json={"is_only_me": True})
+print(r.json()["is_only_me"])   # True (allowed)
+su("PATCH", "/v1/projects/prj_system_examples", headers=JSON, json={"is_only_me": False})   # put it back
+r = su("PATCH", "/v1/projects/prj_system_examples", headers=JSON, json={"name": "mine"})
+print(r.status_code, r.json()["error"]["code"])   # 409 managed_by_yaml
+print(su("DELETE", "/v1/projects/prj_system_examples", params={"confirm": "true"}).status_code)   # 409
 ```
 
 #### 5.8 Delete a config **[SU/P — owner]**
@@ -1198,12 +1327,12 @@ Deleting drops the table **and** its change history, unschedules its job, and fr
 #### 5.9 Dependencies (parents, children, cycles)
 
 ```python
-# 1. a child can't reference a config you don't have
+# 1. a child can't reference a config that is not in the same project
 lonely = ACME_ORDERS_YAML.replace("acme_customers", "no_such_parent").replace(
     "entity: acme_orders", "entity: lonely_orders"
 )
-r = pv("POST", "/v1/configs/validate", headers=YAML, data=lonely)
-print(r.json()["error"]["message"])   # "…not one of your configs…"
+r = pv("POST", f"/v1/projects/{PRJ}/configs/validate", headers=YAML, data=lonely)
+print(r.json()["error"]["message"])   # "…not one of this project's configs (this project has: […])…"
 
 # 2. a parent with ZERO rows can't seed a child
 for leftover in ("starved_child", "empty_parent"):   # start clean (child first) — leftovers from an earlier run
@@ -1222,7 +1351,7 @@ STARVED_CHILD = {
     },
     "seed": {"initial_count": 3},
 }
-r = pv("POST", "/v1/configs", headers=JSON, json=STARVED_CHILD)
+r = pv("POST", f"/v1/projects/{PRJ}/configs", headers=JSON, json=STARVED_CHILD)
 print(r.status_code, r.json().get("error"))   # 409 missing_parent_rows
 
 # give the parent rows, then the same child POST succeeds
@@ -1237,14 +1366,19 @@ for leftover in ("starved_child", "empty_parent"):
 assert find_config(KEY, "acme_orders"), "publish the acme chain first (§5.5) - otherwise this step would really delete acme_customers"
 r = pv("DELETE", f"/v1/configs/{CID}", params={"confirm": "true"})
 print(r.status_code, r.json().get("error"))   # 409 has_dependents (lists acme_orders)
-# delete children first: tickets -> orders -> customers
+# delete children first: tickets -> orders -> customers   (deleting the whole PROJECT does this for you, §5.13)
+
+# 4. refs stop at the project boundary — even for your OWN other project
+OTHER, _ = ensure_project(KEY, "guide_other")
+r = pv("POST", f"/v1/projects/{OTHER}/configs/validate", headers=YAML, data=ACME_ORDERS_YAML)
+print(r.status_code, r.json()["error"]["message"])   # 422 … acme_customers … not one of this project's configs
 ```
 
 #### 5.10 Bad-config gauntlet (every message should be clear)
 
 ```python
 def try_cfg(label: str, body: dict) -> None:
-    r = pv("POST", "/v1/configs/validate", headers=JSON, json=body)
+    r = pv("POST", f"/v1/projects/{PRJ}/configs/validate", headers=JSON, json=body)
     msg = r.json().get("error", {}).get("message", "VALID (unexpected!)")
     if isinstance(msg, list):
         msg = str(msg)
@@ -1282,7 +1416,7 @@ try_cfg("pct 150",           {"entity": "t1", "update_schedule": {"mutate_existi
 try_cfg("fail_rate 1.5",     {"entity": "t1", "failure_injection": {"fail_rate": 1.5}, "fields": PK})
 try_cfg("latency 1e6",       {"entity": "t1", "failure_injection": {"latency_ms": 1_000_000}, "fields": PK})
 try_cfg("initial_count -1",  {"entity": "t1", "seed": {"initial_count": -1}, "fields": PK})
-try_cfg("is_only_me yes",    {"entity": "t1", "is_only_me": "yes", "fields": PK})
+try_cfg("is_only_me (config)", {"entity": "t1", "is_only_me": True, "fields": PK})   # a PROJECT setting
 try_cfg("entity != name",    {"entity": "t1", "name": "t2", "fields": PK})
 ```
 
@@ -1291,20 +1425,20 @@ Each must come back **`422 invalid_config`** and — importantly — **create no
 **Body-level problems**
 
 ```python
-r = pv("POST", "/v1/configs/validate", headers=JSON, data=b"{not json")
+r = pv("POST", f"/v1/projects/{PRJ}/configs/validate", headers=JSON, data=b"{not json")
 print(r.json()["error"]["message"])
 
-r = pv("POST", "/v1/configs/validate", headers=YAML, data=b"- a\n- list\n")
+r = pv("POST", f"/v1/projects/{PRJ}/configs/validate", headers=YAML, data=b"- a\n- list\n")
 print(r.json()["error"]["message"])
 
-r = pv("POST", "/v1/configs/validate", headers=YAML, data=b"a: &a [1,2,3]\nb: [*a,*a]\n")
+r = pv("POST", f"/v1/projects/{PRJ}/configs/validate", headers=YAML, data=b"a: &a [1,2,3]\nb: [*a,*a]\n")
 print(r.json()["error"]["message"])   # anchors not allowed
 
-r = pv("POST", "/v1/configs/validate", headers=YAML, data=("x: " + "y" * 70_000).encode())
+r = pv("POST", f"/v1/projects/{PRJ}/configs/validate", headers=YAML, data=("x: " + "y" * 70_000).encode())
 print(r.status_code, r.json().get("error"))   # 413 payload_too_large
 ```
 
-**Duplicate name:** publish `acme_customers.yaml` again → `409 already_exists`.
+**Duplicate name:** publish `acme_customers.yaml` into the same project again → `409 already_exists` (into a *different* project of yours it succeeds — that is a different schema).
 
 #### 5.11 Quotas — test them by starting the server with small limits
 
@@ -1314,7 +1448,8 @@ Use a **fresh database**:
 # Terminal:
 #   rm -f quota_test.db            # an empty database every time keeps this section re-runnable
 #   DATABASE_URL=sqlite:///./quota_test.db \
-#   MAX_CONFIGS_PER_PROVIDER=2 MAX_FIELDS_PER_CONFIG=9 MAX_INITIAL_COUNT=20 \
+#   MAX_PROJECTS_PER_PROVIDER=2 MAX_CONFIGS_PER_PROJECT=2 MAX_CONFIGS_PER_PROVIDER=3 \
+#   MAX_FIELDS_PER_CONFIG=9 MAX_INITIAL_COUNT=20 \
 #   MAX_LATENCY_MS=50 MAX_ROWS_PER_CONFIG=30 \
 #   API_KEY=$SU uvicorn app.main:app --port 8001
 # Then set BASE = "http://127.0.0.1:8001"
@@ -1322,33 +1457,95 @@ Use a **fresh database**:
 
 | Try                                                 | Expect                                         |
 | --------------------------------------------------- | ---------------------------------------------- |
-| a 3rd config for one provider                       | `409 quota_exceeded` (delete one → slot freed) |
+| a 3rd project for one provider                      | `409 quota_exceeded` ("at most 2 projects"; delete a project → slots freed) |
+| a 3rd config in one project                         | `409 quota_exceeded` ("a project can hold at most 2 configs") |
+| a 4th config across a provider's projects           | `409 quota_exceeded` ("…across all its projects") |
+| `?on_exists=reuse` on a project you already hold    | still `200` — reuse is never blocked by the quota |
 | a config with > 9 fields                            | `422` "too many fields"                        |
 | `initial_count: 21`                                 | `422`                                          |
 | `latency_ms: 51`                                    | `422`                                          |
 | batch/simulate that would pass 30 rows (see §8, §9) | `422 quota_exceeded`                           |
 | scheduler tick near the cap                         | grows only up to the cap, never past it        |
 
-> Tip: `pv("GET", "/v1/me").json()["limits"]` always shows the limits the server actually runs with. Row caps apply to **provider configs** only; built-in YAML configs have no cap.
+> Tip: `pv("GET", "/v1/me").json()` shows `projects_owned`, `configs_owned` and the `limits` the server actually runs with. Row caps apply to **provider configs** only; built-in YAML configs have no cap.
 
 #### 5.12 Superuser publishing for someone else
 
+The superuser creates the **project** for the provider; every config published into it then belongs to that provider (the owner is the project's owner, not whoever typed the request).
+
 ```python
+BP, created = ensure_project(SU, GUIDE_PROJECT, params={"provider_id": B_ID}, owner_key=KEY2)   # owner_key: look among BOB's projects
+print("bob's project:", BP, "created" if created else "reused")
+
 BT_ID, created = ensure_config(SU, {
     "entity": "bobs_things",
     "fields": {"id": {"type": "uuid", "primary_key": True}, "label": {"type": "string"}},
     "seed": {"initial_count": 4},
-}, params={"provider_id": B_ID}, owner_key=KEY2)      # owner_key: look for it among BOB's configs
+}, project=BP, owner_key=KEY2)
 mine = pv2("GET", "/v1/configs", params={"scope": "mine"}).json()["items"]
 pp({"id": BT_ID, "created": created, "owner": next(i for i in mine if i["id"] == BT_ID)["owner"]})
 print([i["name"] for i in mine])
 
-r = pv("POST", "/v1/configs", params={"provider_id": B_ID}, headers=JSON, json={})
-print(r.status_code, r.json().get("error"))   # Alice -> 403
+r = pv("POST", "/v1/projects", params={"provider_id": B_ID}, headers=JSON, json={"name": "sneaky"})
+print(r.status_code, r.json().get("error"))   # Alice -> 403 (you can only create projects for yourself)
 
-r = su("POST", "/v1/configs", params={"provider_id": "prov_nope"}, headers=JSON, json={})
+r = pv("POST", f"/v1/projects/{BP}/configs", headers=JSON, json={})
+print(r.status_code, r.json().get("error"))   # Alice into Bob's (public) project -> 403
+
+r = su("POST", "/v1/projects", params={"provider_id": "prov_nope"}, headers=JSON, json={"name": "x"})
 print(r.status_code, r.json().get("error"))   # 404
 ```
+
+#### 5.13 Project lifecycle: list, read, rename, share, delete **[SU/P — owner]**
+
+```python
+# list and read
+pp([{k: p[k] for k in ("id", "name", "is_only_me", "config_count", "can_write")}
+    for p in pv("GET", "/v1/projects", params={"scope": "mine"}).json()["items"]])
+print("shared with me:", [p["name"] for p in pv2("GET", "/v1/projects", params={"scope": "shared"}).json()["items"]])
+pp(pv("GET", f"/v1/projects/{PRJ}").json())   # detail: its configs [{id, name, cadence}, …]
+
+# rename / describe / share — never touches the data (put everything back in finally)
+OTHER, _ = ensure_project(KEY, "guide_other")
+try:
+    r = pv("PATCH", f"/v1/projects/{OTHER}", headers=JSON,
+           json={"description": "scratch schema", "is_only_me": True})
+    print(r.status_code, r.json()["description"], r.json()["is_only_me"])      # 200 scratch schema True
+    print(pv2("GET", f"/v1/projects/{OTHER}").status_code)                     # 404 — hidden from Bob
+finally:
+    pv("PATCH", f"/v1/projects/{OTHER}", headers=JSON, json={"is_only_me": False})
+
+# negatives
+for body in ({}, {"nope": 1}, {"name": "Bad Name"}, {"is_only_me": "yes"}):
+    r = pv("PATCH", f"/v1/projects/{OTHER}", headers=JSON, json=body)
+    print(r.status_code, body)                                                  # 422 each
+r = pv("PATCH", f"/v1/projects/{OTHER}", headers=JSON, json={"name": GUIDE_PROJECT})
+print(r.status_code, r.json()["error"]["code"])                                 # 409 already_exists
+print(pv2("PATCH", f"/v1/projects/{PRJ}", headers=JSON, json={"description": "x"}).status_code)   # Bob -> 403
+```
+
+**Delete a project = delete its whole schema.** Every config in it and all their data go, children first; the quota slots and the names come back.
+
+```python
+SCRATCH, _ = ensure_project(KEY, "guide_scratch")
+ensure_config(KEY, {"entity": "sc_parent", "fields": {"id": {"type": "uuid", "primary_key": True}},
+                    "seed": {"initial_count": 2}}, project=SCRATCH)
+ensure_config(KEY, {"entity": "sc_child", "fields": {"id": {"type": "uuid", "primary_key": True},
+                                                    "p": {"type": "ref", "ref_entity": "sc_parent"}},
+                    "seed": {"initial_count": 3}}, project=SCRATCH)
+
+r = pv("DELETE", f"/v1/projects/{SCRATCH}")
+print(r.status_code, r.json()["error"]["code"])        # 400 confirmation_required (nothing deleted)
+print(pv2("DELETE", f"/v1/projects/{SCRATCH}", params={"confirm": "true"}).status_code)   # Bob -> 403
+
+r = pv("DELETE", f"/v1/projects/{SCRATCH}", params={"confirm": "true"})
+pp(r.json())   # {"deleted": true, "id": "prj_…", "name": "guide_scratch", "configs_deleted": 2}
+print(pv("GET", f"/v1/projects/{SCRATCH}").status_code)   # 404 — and so is every config that was in it
+```
+
+Re-running the cell is safe: `ensure_*` rebuild the scratch project, and the delete converges to the same end state. The built-in `examples` project can be hidden/shown but not renamed or deleted (`409 managed_by_yaml`, §5.7).
+
+---
 
 ---
 
@@ -1603,6 +1800,39 @@ print(pv("POST", f"/v1/configs/{OID}/batch", headers=JSON, json={"mode": "bogus"
 print(pv("POST", f"/v1/configs/{OID}/batch", headers=JSON, json={"count": -1}).status_code)       # 422
 ```
 
+#### 8.6 Project batch — refresh a whole schema in one call **[P-owner/SU]**
+
+`POST /v1/projects/{id}/batch` takes the same body as §8 (`mode`, `count`, `batch_size`, `seed`, `confirm`) and applies it to **every config in the project**, parents first, in one all-or-nothing transaction. Without `count`, each config uses its own `seed.initial_count`. Every config's row cap is checked **before** anything is written.
+
+```python
+BATCH, _ = ensure_project(KEY, "guide_batch", description="project batch demo")
+ensure_config(KEY, {"entity": "pb_parent", "fields": {"id": {"type": "uuid", "primary_key": True},
+                                                      "label": {"type": "string", "key_label": "full_name"}},
+                    "seed": {"initial_count": 3}}, project=BATCH)
+ensure_config(KEY, {"entity": "pb_child", "fields": {"id": {"type": "uuid", "primary_key": True},
+                                                    "p": {"type": "ref", "ref_entity": "pb_parent"}},
+                    "seed": {"initial_count": 4}}, project=BATCH)
+
+r = pv("POST", f"/v1/projects/{BATCH}/batch", headers=JSON, json={"mode": "replace"})
+print(r.status_code, r.json()["error"]["code"])        # 400 confirmation_required
+
+r = pv("POST", f"/v1/projects/{BATCH}/batch", headers=JSON, json={"mode": "replace", "confirm": True, "seed": 42})
+pp(r.json())   # project{…}; entities in dependency order: pb_parent then pb_child; total_rows 3 and 4
+
+# the same seed gives the same rows every time, so this is a re-run-safe way to baseline a whole schema
+ids = lambda cid: [row["id"] for row in iter_rows(KEY, cid)]
+first = {n: ids(find_config(KEY, n, BATCH)["id"]) for n in ("pb_parent", "pb_child")}
+pv("POST", f"/v1/projects/{BATCH}/batch", headers=JSON, json={"mode": "replace", "confirm": True, "seed": 42})
+second = {n: ids(find_config(KEY, n, BATCH)["id"]) for n in ("pb_parent", "pb_child")}
+print(first == second)                                  # True
+
+# append: +2 rows in EACH config; another project is never touched
+pp(pv("POST", f"/v1/projects/{BATCH}/batch", headers=JSON, json={"mode": "append", "count": 2, "seed": 7}).json()["entities"])
+print(pv2("POST", f"/v1/projects/{BATCH}/batch", headers=JSON, json={}).status_code)   # Bob -> 403 (readable, not writable)
+```
+
+> `append` with a fixed seed is **not** re-run safe (the same seed twice is `409 duplicate_primary_key`, §8.1); `replace` + seed is. An empty project answers `409 empty_project`.
+
 ---
 
 ### 9. Simulate (inserts + updates + deletes on demand)
@@ -1741,13 +1971,47 @@ for f in manifest["files"]:
     conn.executescript(zf.read(f["file"]).decode())
 ```
 
+**The whole project as one zip.** `GET /v1/projects/{id}/export` bundles **every** config in the project (parents first) — no id list needed — and the manifest names the project:
+
+```python
+r = pv("GET", f"/v1/projects/{PRJ}/export", params={"format": "sql"})
+r.raise_for_status()
+print(r.headers["content-disposition"])                  # attachment; filename="guide_lab-export.zip"
+zf = zipfile.ZipFile(io.BytesIO(r.content))
+manifest = json.loads(zf.read("manifest.json"))
+print(manifest["project"], manifest["load_order"][:3])   # {"id": "prj_…", "name": "guide_lab"} …
+
+conn = sqlite3.connect(":memory:")
+conn.execute("PRAGMA foreign_keys=ON")
+conn.executescript(zf.read("schema.sql").decode())       # the project as one schema
+for f in manifest["files"]:
+    conn.executescript(zf.read(f["file"]).decode())
+print(conn.execute("SELECT count(*) FROM acme_orders").fetchone())
+
+# PostgreSQL: schema.sql opens with CREATE SCHEMA + SET search_path, and the manifest says so
+r = pv("GET", f"/v1/projects/{PRJ}/export", params={"dialect": "postgresql"})
+zpg = zipfile.ZipFile(io.BytesIO(r.content))
+assert "SET search_path TO guide_lab;" in zpg.read("schema.sql").decode()
+print(json.loads(zpg.read("manifest.json"))["handoff"])
+
+# mix a delta for one config with snapshots of the rest (changes are csv/ndjson only)
+cur = pv("GET", f"/v1/configs/{OID}/changes", params={"since": 0, "limit": 1}).json()["latest_version"]
+r = pv("GET", f"/v1/projects/{PRJ}/export", params={"since": f"{OID}={cur}"})
+print("acme_orders.changes.csv" in zipfile.ZipFile(io.BytesIO(r.content)).namelist())   # True
+
+# a project you can read works for you too; a private one is a 404; an empty one is a 409
+print(pv2("GET", f"/v1/projects/{PRJ}/export").status_code)                   # 200 (public)
+EMPTY, _ = ensure_project(KEY, "guide_scratch")
+print(pv("GET", f"/v1/projects/{EMPTY}/export").json()["error"]["code"])      # empty_project (or 200 if you left configs in it)
+```
+
 **Bundle errors**
 
 | Request                                    | Expected                 |
 | ------------------------------------------ | ------------------------ |
 | no `configs` param                         | `422 validation_error`   |
 | empty `configs`                            | `422 invalid_request`    |
-| two different owners                       | `422 mixed_owners`       |
+| configs from two different projects (same owner or not) | `422 mixed_projects` |
 | `since=<id>=5` where id isn't in `configs` | `422 since_not_targeted` |
 | `format=sql` with any `since`              | `422 unsupported_format` |
 | a config you can't read                    | `404 not_found`          |
@@ -1762,7 +2026,7 @@ print(r.headers.get("content-type"))
 print(r.text)   # CREATE TABLE IF NOT EXISTS acme_customers … then acme_orders
 
 r = pv("GET", f"/v1/configs/{OID}/ddl", params={"include_parents": "false"})
-assert "acme_customers" not in r.text
+assert "CREATE TABLE IF NOT EXISTS acme_customers" not in r.text   # the parent is not created (the FK still names it)
 
 r = pv("GET", f"/v1/configs/{OID}/ddl", params={"dialect": "postgresql"})
 print("TIMESTAMP" in r.text)
@@ -1772,6 +2036,30 @@ assert not re.search(r"\bd_[0-9a-f]{10}_", r.text)   # no internal names leak
 
 print(pv("GET", f"/v1/configs/{OID}/ddl", params={"dialect": "mysql"}).status_code)  # 422
 ```
+
+**The whole project as a schema** — `GET /v1/projects/{id}/ddl` is every table in the project, parents first, under your own names:
+
+```python
+r = pv("GET", f"/v1/projects/{PRJ}/ddl")
+print(r.text[:240])                       # -- Project: guide_lab (SQLite has no schemas; the tables below are its configs)
+assert r.text.index("CREATE TABLE IF NOT EXISTS acme_customers") < r.text.index("CREATE TABLE IF NOT EXISTS acme_orders")
+assert not re.search(r"\bd_[0-9a-f]{10}_", r.text)          # no internal names
+
+# runs on its own, foreign keys and all
+conn = sqlite3.connect(":memory:")
+conn.execute("PRAGMA foreign_keys=ON")
+conn.executescript(r.text)
+
+# on PostgreSQL the project BECOMES a schema
+r = pv("GET", f"/v1/projects/{PRJ}/ddl", params={"dialect": "postgresql"})
+assert "CREATE SCHEMA IF NOT EXISTS guide_lab;" in r.text and "SET search_path TO guide_lab;" in r.text
+print(r.text[:200])
+
+print(pv2("GET", f"/v1/projects/{PRJ}/ddl").status_code)                  # 200 — Bob may read a public project
+print(pv("GET", f"/v1/projects/{PRJ}/ddl", params={"dialect": "mysql"}).status_code)   # 422
+```
+
+Project names are plain lowercase identifiers (`^[a-z][a-z0-9_]{0,31}$`), which is what makes them safe to use unquoted as a schema name. An empty project's DDL is just the header (and the `CREATE SCHEMA` line on PostgreSQL).
 
 Legacy (superuser): `su("GET", "/ddl", params={"dialect": "postgresql", "include_system": "true"})`.
 
@@ -1843,24 +2131,65 @@ def sweep(key: str, config_id: str, read_only: bool = False) -> None:
 
 sweep(KEY2, OID)
 # GETs → 200 (except missing row 404); writes → 403
+
+def sweep_project(key: str, project_id: str, read_only: bool = False) -> None:
+    """The same idea one level up: every route that takes a project id."""
+    specs = [
+        ("GET", f"/v1/projects/{project_id}"),
+        ("GET", f"/v1/projects/{project_id}/configs"),
+        ("GET", f"/v1/projects/{project_id}/ddl"),
+        ("GET", f"/v1/projects/{project_id}/export"),
+        ("PATCH", f"/v1/projects/{project_id}"),
+        ("DELETE", f"/v1/projects/{project_id}?confirm=true"),
+        ("POST", f"/v1/projects/{project_id}/configs"),
+        ("POST", f"/v1/projects/{project_id}/configs/validate"),
+        ("POST", f"/v1/projects/{project_id}/batch"),
+    ]
+    if read_only:
+        specs = [s for s in specs if s[0] == "GET"]
+    for method, path in specs:
+        path_only, _, qs = path.partition("?")
+        params = dict(p.split("=") for p in qs.split("&") if p) if qs else None
+        r = requests.request(method, f"{BASE}{path_only}", headers={**_headers(key), **JSON}, json={}, params=params)
+        print(f"{method:7} {path:58} {r.status_code}")
+
+sweep_project(KEY2, PRJ)
+# GETs → 200; PATCH / DELETE / POST (publish, validate, batch) → 403 — a public project is readable, never writable
 ```
 
-#### 15.2 Private config: invisible to everyone but owner and superuser
+#### 15.2 Private project: invisible to everyone but owner and superuser
+
+Visibility is the **project's**: hiding the project hides every config inside it.
 
 ```python
 try:
-    pv("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"is_only_me": True})
-    sweep(KEY2, OID)   # EVERY line -> 404
-    print(any(i["name"] == "acme_orders" for i in pv2("GET", "/v1/configs", params={"scope": "all"}).json()["items"]))  # False
-    sweep(SU, OID, read_only=True)     # superuser still sees it (GETs only — see sweep's docstring)
+    r = pv("PATCH", f"/v1/projects/{PRJ}", headers=JSON, json={"is_only_me": True})
+    print(r.status_code, r.json()["is_only_me"])     # 200 True
+    sweep(KEY2, OID)                                 # EVERY line -> 404 (the config is inside the hidden project)
+    sweep_project(KEY2, PRJ)                         # EVERY line -> 404
+    print(any(i["name"] == "acme_orders" for i in pv2("GET", "/v1/configs", params={"scope": "all"}).json()["items"]))   # False
+    print(PRJ in {p["id"] for p in pv2("GET", "/v1/projects").json()["items"]})                                          # False
+    sweep(SU, OID, read_only=True)                   # superuser still sees it (GETs only — see sweep's docstring)
+    sweep_project(SU, PRJ, read_only=True)
 finally:
-    pv("PATCH", f"/v1/configs/{OID}", headers=JSON, json={"is_only_me": False})
+    pv("PATCH", f"/v1/projects/{PRJ}", headers=JSON, json={"is_only_me": False})   # always restore
+
+# a hidden project is indistinguishable from one that never existed
+print(pv2("GET", "/v1/projects/prj_000000000000").status_code)    # 404
 ```
 
-#### 15.3 Tenants never meet
+**A project created private from the start** (re-run safe — `ensure_project` never edits an existing one):
 
 ```python
-# same name, two providers, separate data — allowed
+HIDDEN, created = ensure_project(KEY, "guide_private", description="only mine", is_only_me=True)
+print(pv2("GET", f"/v1/projects/{HIDDEN}").status_code)           # 404 for Bob
+print(pv("GET", f"/v1/projects/{HIDDEN}").json()["is_only_me"])   # True for Alice
+```
+
+#### 15.3 Tenants never meet#### 15.3 Tenants never meet
+
+```python
+# same name, two providers, separate data — allowed (and so is the same name in two of ONE provider's projects)
 ensure_config(KEY, {
     "entity": "shared_name",
     "fields": {"id": {"type": "uuid", "primary_key": True}},
@@ -1872,9 +2201,16 @@ ensure_config(KEY2, {
     "seed": {"initial_count": 9},
 })
 
-# a config can't reference another provider's config
-r = pv2("POST", "/v1/configs/validate", headers=YAML, data=ACME_ORDERS_YAML)
+# a config can't reference another provider's config (it isn't in Bob's project)
+r = pv2("POST", f"/v1/projects/{PRJ2}/configs/validate", headers=YAML, data=ACME_ORDERS_YAML)
 print(r.json()["error"]["message"])
+
+# ...nor your own config in a different project of yours
+OTHER, _ = ensure_project(KEY, "guide_other")
+ensure_config(KEY, {"entity": "shared_name", "fields": {"id": {"type": "uuid", "primary_key": True}},
+                    "seed": {"initial_count": 1}}, project=OTHER)        # same name as in guide_lab: allowed
+r = pv("POST", f"/v1/projects/{OTHER}/configs/validate", headers=YAML, data=ACME_ORDERS_YAML)
+print(r.status_code)                                                      # 422 — acme_customers lives in guide_lab
 
 # a ROW can't point at another provider's parent
 ensure_config(KEY2, {
@@ -1917,6 +2253,12 @@ r = su("POST", "/v1/configs/cfg_sys_orders/data", headers=JSON, json={})
 print(r.status_code)  # 201
 if r.ok:   # soft-delete the probe row so re-runs leave the built-in table unchanged
     su("DELETE", f"/v1/configs/cfg_sys_orders/data/{r.json()['order_id']}")
+
+# the examples form ONE read-only project
+ex = next(p for p in pv("GET", "/v1/projects", params={"scope": "shared"}).json()["items"] if p["source"] == "yaml")
+print(ex["id"], ex["name"], ex["owner"]["id"], ex["can_write"])           # prj_system_examples examples prov_system False
+print(pv("POST", "/v1/projects/prj_system_examples/configs", headers=JSON, json={}).status_code)   # 403 for a provider
+print(su("POST", "/v1/projects/prj_system_examples/configs", headers=JSON, json={"entity": "x", "fields": {}}).json()["error"]["code"])   # managed_by_yaml
 ```
 
 #### 15.5 Superuser powers over provider data
@@ -2021,7 +2363,7 @@ st("GET", "/health")  # 200
 
 ### 17. CLI (no server needed)
 
-The CLI talks **directly to the database** named by `DATABASE_URL`. It works on the **built-in YAML entities**; provider-published configs are managed only through `/v1`. It bypasses HTTP auth entirely.
+The CLI talks **directly to the database** named by `DATABASE_URL`. It works on the **built-in YAML entities**; projects and configs published by providers are managed only through `/v1`. It bypasses HTTP auth entirely.
 
 ```python
 import subprocess
@@ -2070,25 +2412,27 @@ Every failure uses one envelope: `{"error":{"code":"…","message":"…"}}` (a v
 | Code                                                                                               |      HTTP       | When                                                                                                                                                 |
 | -------------------------------------------------------------------------------------------------- | :-------------: | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `unauthorized`                                                                                     |       401       | missing / wrong / revoked key, inactive provider (adds `WWW-Authenticate: ApiKey`)                                                                   |
-| `forbidden`                                                                                        |       403       | provider key on a superuser/legacy route · write to someone else's config · creating a config for another provider                                   |
-| `not_found`                                                                                        |       404       | unknown **or private** config · row missing or soft-deleted · unknown provider/key · unknown entity on `/scheduler/runs`                             |
+| `forbidden`                                                                                        |       403       | provider key on a superuser/legacy route · write to someone else's project or config · creating a project for another provider                       |
+| `not_found`                                                                                        |       404       | unknown **or private** project / config · row missing or soft-deleted · unknown provider/key · unknown entity on `/scheduler/runs`                   |
 | `validation_error`                                                                                 |       422       | bad query/body shape (e.g. `limit=0`, `mode=bogus`, `format=xml`, missing `entity`)                                                                  |
 | `invalid_config`                                                                                   |       422       | a config (or body) failed validation — the message says exactly why                                                                                  |
 | `invalid_request`                                                                                  |       422       | bad `PATCH` body · empty `configs` in a bundle                                                                                                       |
 | `invalid_provider` / `invalid_label`                                                               |       422       | bad `full_name` / key label                                                                                                                          |
+| `invalid_project`                                                                                  |       422       | bad project body: name, unknown key, description, `is_only_me` (a config body with `is_only_me` is `invalid_config`)                                 |
 | `payload_too_large`                                                                                |       413       | config body over `MAX_CONFIG_BYTES`                                                                                                                  |
-| `already_exists`                                                                                   |       409       | config name already used by this owner · provider `full_name` already taken (create or rename)                              |
-| `quota_exceeded`                                                                                   |    409 / 422    | too many configs (**409**) · too many rows (**422**)                                                                                                 |
-| `managed_by_yaml`                                                                                  |       409       | edit/delete of a built-in config                                                                                                                     |
+| `already_exists`                                                                                   |       409       | project name already used by this owner (add `?on_exists=reuse` to reuse it) · config name already used in this project · provider `full_name` taken |
+| `quota_exceeded`                                                                                   |    409 / 422    | too many projects / configs per project / configs per provider (**409**) · too many rows (**422**)                                                   |
+| `managed_by_yaml`                                                                                  |       409       | edit/delete of a built-in config · rename/delete of, or publishing into, the built-in `examples` project                                              |
 | `has_dependents`                                                                                   |       409       | change fields of / delete a config others reference                                                                                                  |
-| `confirmation_required`                                                                            |       400       | delete config · change fields · `replace`/`reset` without confirm                                                                                    |
+| `confirmation_required`                                                                            |       400       | delete project or config · change fields · `replace`/`reset` without confirm (config or project batch)                                               |
 | `missing_parent_rows`                                                                              |       409       | a child has no parent rows to point at                                                                                                               |
+| `empty_project`                                                                                    |       409       | export or batch of a project that has no configs yet                                                                                                |
 | `busy`                                                                                             |       409       | another bulk write held the lock > 30 s                                                                                                              |
 | `not_supported`                                                                                    | 400 / 409 / 422 | row delete on a config with no soft-delete field (400) · modifying the system provider (409) · `deletes` in simulate with no soft-delete field (422) |
 | `unknown_field` · `read_only_field` · `invalid_value` · `invalid_reference`                        |       422       | row write validation (`/v1`)                                                                                                                         |
 | `cursor_ahead_of_source`                                                                           |       409       | `since` is beyond the latest version (usually after `reset`)                                                                                         |
 | `duplicate_primary_key`                                                                            |       409       | a seeded insert generated a key that already exists — use a different seed                                                                           |
-| `unsupported_format` · `invalid_since` · `since_not_targeted` · `mixed_owners`                     |       422       | export request problems                                                                                                                              |
+| `unsupported_format` · `invalid_since` · `since_not_targeted` · `mixed_projects`                   |       422       | export request problems (`mixed_projects`: a bundle's configs come from more than one project)                                                       |
 | `unknown_entity` · `counts_not_targeted` · `invalid_mode` · `invalid_batch_size` · `invalid_count` |       422       | legacy `/admin/*` & CLI request problems                                                                                                             |
 | `injected_failure`                                                                                 |       500       | failure injection fired                                                                                                                              |
 
@@ -2107,28 +2451,35 @@ Every failure uses one envelope: `{"error":{"code":"…","message":"…"}}` (a v
 
 #### 19.2 Everything survives a restart
 
-1. Create a provider, publish a **private** config (`is_only_me: true`), note the key and config id.
+1. Create a provider, create a **private project**, publish a config into it, note the key and the config id.
 2. Stop the server, start it again (same `DATABASE_URL`, same superuser key).
-3. Verify: `st("GET", "/v1/me", key=KEY)` → `200` · rows intact · superuser still reads the private config · unknown key still → `401` · writes still work.
-4. Providers, hashed keys, configs and data persist. The config's scheduler job is re-registered.
+3. Verify: `st("GET", "/v1/me", key=KEY)` → `200` and `projects_owned` / `configs_owned` still right · the project is still private and still holds its config · rows intact · superuser still reads the private config · unknown key still → `401` · writes still work.
+4. Providers, hashed keys, projects, configs and data persist. The config's scheduler job is re-registered.
 
 Step 1 as code (re-run safe — the key lives in the state file, so it is still there after the restart):
 
 ```python
 rita = ensure_provider("Restart Test")
 RKEY = rita["api_key"]
+RPRJ, _ = ensure_project(RKEY, "vault", description="restart probe", is_only_me=True)
 RCID, created = ensure_config(RKEY, {
     "entity": "restart_probe",
-    "is_only_me": True,
     "fields": {"id": {"type": "uuid", "primary_key": True}, "label": {"type": "string"}},
     "seed": {"initial_count": 5},
-})
-print(RKEY[:8] + "…", RCID, "created" if created else "reused")
+}, project=RPRJ)
+print(RKEY[:8] + "…", RPRJ, RCID, "created" if created else "reused")
 
 # after the restart (step 3):
 st("GET", "/v1/me", key=RKEY)                                                                          # 200
+pp({k: v for k, v in requests.get(f"{BASE}/v1/me", headers=_headers(RKEY)).json().items() if k != "limits"})   # projects_owned 1, configs_owned 1
+proj = requests.get(f"{BASE}/v1/projects/{RPRJ}", headers=_headers(RKEY)).json()
+print(proj["is_only_me"], proj["config_count"])                                                        # True 1
 print(len(requests.get(f"{BASE}/v1/configs/{RCID}/data", headers=_headers(RKEY)).json()["items"]))   # 5 rows intact
+print(su("GET", f"/v1/configs/{RCID}/data").status_code)                                              # 200 — the superuser still reads it
+# clean up when you are done:  drop_project(RKEY, "vault")   (teardown(RKEY) does it too)
 ```
+
+**Upgrading a database from before projects.** Start the new build against the old database: the startup step files each provider's existing configs under one `default` project (the built-in examples go to `examples`) and rebuilds `registry_configs` so a config name is unique *per project*. It is idempotent (a second start changes nothing) and no table is renamed or moved. **Privacy is never loosened:** a provider with *any* private config gets a **private** `default` project — check it with `GET /v1/projects` and share it again with `PATCH /v1/projects/{id}` if that was too strict. Try it on a copy of your data first; it was exercised on SQLite, not on a live PostgreSQL.
 
 #### 19.3 PostgreSQL
 
@@ -2148,15 +2499,18 @@ print(len(requests.get(f"{BASE}/v1/configs/{RCID}/data", headers=_headers(RKEY))
 #   requests.get("http://localhost:8000/health")
 ```
 
-#### 19.5 Automated tests (310 tests)
+#### 19.5 Automated tests (355 tests)
 
 ```python
 # Terminal:
 #   pytest -v
 #   pytest -v tests/test_v1_access.py
 #   pytest -v -k "scheduler"
+#   pytest -v tests/test_v1_projects.py        # projects: CRUD, quotas, isolation, schema DDL/export, migration
 #   TEST_DATABASE_URL=postgresql+psycopg2://… pytest -v
 ```
+
+The suite never reads `configs/*.yaml` — those are examples. The built-in entities its legacy-route tests need come from `tests/entity_fixtures.py`, written to a temp folder that `CONFIG_DIR` points at; every other test builds its configs inline (so you can edit or delete the examples freely).
 
 > ⚠ `TEST_DATABASE_URL` must point at an **empty** database — its `public` schema is **wiped**.
 
@@ -2164,7 +2518,7 @@ print(len(requests.get(f"{BASE}/v1/configs/{RCID}/data", headers=_headers(RKEY))
 
 ### 20. One-shot smoke-test script
 
-Save as `smoke_test.py`, then run: `SU=<superuser key> python smoke_test.py`. Requires `requests` and a server **with a superuser key set**. It is re-runnable: the providers `Smoke Alice` / `Smoke Bob` are found and reused (reactivated, one fresh key each — providers can't be deleted), configs left over from an interrupted run are dropped first, and at the end it deletes its own configs, revokes every key it issued and deactivates both providers.
+Save as `smoke_test.py`, then run: `SU=<superuser key> python smoke_test.py`. Requires `requests` and a server **with a superuser key set**. It exercises projects (create, schema DDL, zip export, project batch, privacy, delete) as well as configs. It is re-runnable: the providers `Smoke Alice` / `Smoke Bob` are found and reused (reactivated, one fresh key each — providers can't be deleted), configs left over from an interrupted run are dropped first, and at the end it deletes its own configs, revokes every key it issued and deactivates both providers.
 
 ```python
 #!/usr/bin/env python3
@@ -2217,12 +2571,12 @@ def ensure_provider(full_name: str) -> dict:
     return {"id": p["id"], "api_key": k["api_key"], "key_id": k["key"]["id"]}
 
 
-def drop_config(key: str, name: str) -> None:
-    """Delete one of this provider's configs by name, if it exists."""
-    items = requests.get(f"{BASE}/v1/configs", headers={"X-API-Key": key}, params={"scope": "mine"}).json()["items"]
+def drop_project(key: str, name: str) -> None:
+    """Delete one of this provider's projects by name, if it exists — and with it every config inside."""
+    items = requests.get(f"{BASE}/v1/projects", headers={"X-API-Key": key}, params={"scope": "mine"}).json()["items"]
     for i in items:
         if i["name"] == name:
-            requests.delete(f"{BASE}/v1/configs/{i['id']}", headers={"X-API-Key": key}, params={"confirm": "true"})
+            requests.delete(f"{BASE}/v1/projects/{i['id']}", headers={"X-API-Key": key}, params={"confirm": "true"})
 
 
 print("== auth ==")
@@ -2244,11 +2598,23 @@ check("provider cannot list providers", 403, "GET", "/v1/admin/providers", heade
 check("provider cannot use legacy /entities", 403, "GET", "/entities", headers=AH)
 check("provider cannot use /admin/batch", 403, "POST", "/admin/batch", headers={**AH, **JSON}, json={})
 
+print("== projects ==")
+drop_project(A_KEY, "smoke_shop")        # leftovers from an interrupted run (takes its configs with it)
+drop_project(A_KEY, "smoke_other")
+PRJ = requests.post(f"{BASE}/v1/projects", headers={**AH, **JSON},
+                    json={"name": "smoke_shop", "description": "smoke test schema"}).json()
+P_ID = PRJ["id"]
+check("create project", 200, "GET", f"/v1/projects/{P_ID}", headers=AH)
+check("duplicate project -> 409", 409, "POST", "/v1/projects", headers={**AH, **JSON}, json={"name": "smoke_shop"})
+check("reuse project -> 200", 200, "POST", "/v1/projects?on_exists=reuse", headers={**AH, **JSON}, json={"name": "smoke_shop"})
+check("bad project name -> 422", 422, "POST", "/v1/projects", headers={**AH, **JSON}, json={"name": "Bad Name"})
+check("project for someone else -> 403", 403, "POST", f"/v1/projects?provider_id={B_ID}", headers={**AH, **JSON}, json={"name": "nope"})
+check("Bob cannot publish into it -> 403", 403, "POST", f"/v1/projects/{P_ID}/configs", headers={**BH, **JSON}, json={})
+check("Bob cannot rename it -> 403", 403, "PATCH", f"/v1/projects/{P_ID}", headers={**BH, **JSON}, json={"description": "x"})
+
 print("== configs ==")
-for leftover in ("smoke_orders", "smoke_customers"):   # children first: leftovers from an interrupted run
-    drop_config(A_KEY, leftover)
 CUST = requests.post(
-    f"{BASE}/v1/configs",
+    f"{BASE}/v1/projects/{P_ID}/configs",
     headers={**AH, **YAML},
     data="""\
 entity: smoke_customers
@@ -2262,7 +2628,7 @@ seed: { initial_count: 10 }
 ).json()
 C_ID = CUST["id"]
 ORD = requests.post(
-    f"{BASE}/v1/configs",
+    f"{BASE}/v1/projects/{P_ID}/configs",
     headers={**AH, **YAML},
     data="""\
 entity: smoke_orders
@@ -2283,11 +2649,13 @@ else:
     print("FAIL  seeding")
     FAIL = 1
 
-check("duplicate name -> 409", 409, "POST", "/v1/configs", headers={**AH, **JSON},
+check("duplicate name -> 409", 409, "POST", f"/v1/projects/{P_ID}/configs", headers={**AH, **JSON},
       json={"entity": "smoke_customers", "fields": {"id": {"type": "uuid", "primary_key": True}}})
-check("bad config -> 422", 422, "POST", "/v1/configs", headers={**AH, **JSON},
+check("bad config -> 422", 422, "POST", f"/v1/projects/{P_ID}/configs", headers={**AH, **JSON},
       json={"entity": "Bad Name", "fields": {"id": {"type": "uuid", "primary_key": True}}})
-check("validate dry run", 200, "POST", "/v1/configs/validate", headers={**AH, **JSON},
+check("is_only_me on a config -> 422", 422, "POST", f"/v1/projects/{P_ID}/configs", headers={**AH, **JSON},
+      json={"entity": "t_priv", "is_only_me": True, "fields": {"id": {"type": "uuid", "primary_key": True}}})
+check("validate dry run", 200, "POST", f"/v1/projects/{P_ID}/configs/validate", headers={**AH, **JSON},
       json={"entity": "dry_run", "fields": {"id": {"type": "uuid", "primary_key": True}}})
 check("parent delete blocked", 409, "DELETE", f"/v1/configs/{C_ID}?confirm=true", headers=AH)
 check("delete w/o confirm -> 400", 400, "DELETE", f"/v1/configs/{O_ID}", headers=AH)
@@ -2336,19 +2704,53 @@ check("delta export", 200, "GET", f"/v1/configs/{O_ID}/export?since={CUR}", head
 check("delta as sql -> 422", 422, "GET", f"/v1/configs/{O_ID}/export?since=0&format=sql", headers=AH)
 check("ddl", 200, "GET", f"/v1/configs/{O_ID}/ddl", headers=AH)
 check("bundle zip", 200, "GET", f"/v1/export?configs={C_ID},{O_ID}&format=csv", headers=AH)
-check("bundle mixed owners -> 422", 422, "GET", f"/v1/export?configs={C_ID},cfg_sys_orders", headers=AH)
+check("bundle mixed projects -> 422", 422, "GET", f"/v1/export?configs={C_ID},cfg_sys_orders", headers=AH)
+
+print("== the project as a schema ==")
+import io, zipfile
+ddl = requests.get(f"{BASE}/v1/projects/{P_ID}/ddl", headers=AH).text
+if ddl.index("smoke_customers") < ddl.index("smoke_orders") and "d_" not in ddl.split("CREATE TABLE")[1][:20]:
+    print("PASS  project DDL lists the parent before the child, under logical names")
+else:
+    print("FAIL  project DDL")
+    FAIL = 1
+pg = requests.get(f"{BASE}/v1/projects/{P_ID}/ddl", headers=AH, params={"dialect": "postgresql"}).text
+if "CREATE SCHEMA IF NOT EXISTS smoke_shop;" in pg and "SET search_path TO smoke_shop;" in pg:
+    print("PASS  postgresql DDL creates the schema")
+else:
+    print("FAIL  postgresql schema DDL")
+    FAIL = 1
+z = requests.get(f"{BASE}/v1/projects/{P_ID}/export", headers=BH)   # Bob may read a public project
+names = sorted(zipfile.ZipFile(io.BytesIO(z.content)).namelist()) if z.status_code == 200 else []
+if names == ["manifest.json", "schema.sql", "smoke_customers.csv", "smoke_orders.csv"]:
+    print("PASS  project zip holds every table")
+else:
+    print(f"FAIL  project zip: {z.status_code} {names}")
+    FAIL = 1
+check("project batch needs confirm for replace", 400, "POST", f"/v1/projects/{P_ID}/batch", headers={**AH, **JSON}, json={"mode": "replace"})
+check("project batch replace", 200, "POST", f"/v1/projects/{P_ID}/batch", headers={**AH, **JSON},
+      json={"mode": "replace", "confirm": True, "seed": 42})
+check("Bob cannot batch Alice's project -> 403", 403, "POST", f"/v1/projects/{P_ID}/batch", headers={**BH, **JSON}, json={})
+OTHER = requests.post(f"{BASE}/v1/projects", headers={**AH, **JSON}, json={"name": "smoke_other"}).json()["id"]
+check("ref across projects -> 422", 422, "POST", f"/v1/projects/{OTHER}/configs", headers={**AH, **YAML},
+      data="entity: smoke_orders\nfields:\n  id: { type: uuid, primary_key: true }\n  c: { type: ref, ref_entity: smoke_customers }\n")
+check("empty project export -> 409", 409, "GET", f"/v1/projects/{OTHER}/export", headers=AH)
 
 print("== sharing & isolation ==")
 check("Bob reads Alice (public)", 200, "GET", f"/v1/configs/{O_ID}/data?limit=1", headers=BH)
 check("Bob writes Alice -> 403", 403, "POST", f"/v1/configs/{O_ID}/data", headers={**BH, **JSON}, json={})
 check("Bob batch Alice -> 403", 403, "POST", f"/v1/configs/{O_ID}/batch", headers={**BH, **JSON}, json={})
-check("Alice goes private", 200, "PATCH", f"/v1/configs/{O_ID}", headers={**AH, **JSON},
+check("config refuses is_only_me -> 422", 422, "PATCH", f"/v1/configs/{O_ID}", headers={**AH, **JSON},
+      json={"is_only_me": True})
+check("Alice makes the PROJECT private", 200, "PATCH", f"/v1/projects/{P_ID}", headers={**AH, **JSON},
       json={"is_only_me": True})
 check("Bob reads private -> 404", 404, "GET", f"/v1/configs/{O_ID}/data?limit=1", headers=BH)
+check("Bob reads the private project -> 404", 404, "GET", f"/v1/projects/{P_ID}", headers=BH)
+check("Bob exports the private project -> 404", 404, "GET", f"/v1/projects/{P_ID}/export", headers=BH)
 check("Bob writes private -> 404", 404, "POST", f"/v1/configs/{O_ID}/data", headers={**BH, **JSON}, json={})
 check("superuser reads private", 200, "GET", f"/v1/configs/{O_ID}/data?limit=1", headers=SUH)
 check("superuser writes private", 201, "POST", f"/v1/configs/{O_ID}/data", headers={**SUH, **JSON}, json={})
-check("Alice goes public again", 200, "PATCH", f"/v1/configs/{O_ID}", headers={**AH, **JSON},
+check("Alice shares the project again", 200, "PATCH", f"/v1/projects/{P_ID}", headers={**AH, **JSON},
       json={"is_only_me": False})
 
 print("== failure injection ==")
@@ -2363,6 +2765,10 @@ check("row read recovers", 200, "GET", f"/v1/configs/{O_ID}/data?limit=1", heade
 print("== key rotation & cleanup ==")
 check("delete child config", 200, "DELETE", f"/v1/configs/{O_ID}?confirm=true", headers=AH)
 check("delete parent config", 200, "DELETE", f"/v1/configs/{C_ID}?confirm=true", headers=AH)
+check("delete project w/o confirm -> 400", 400, "DELETE", f"/v1/projects/{OTHER}", headers=AH)
+check("delete project", 200, "DELETE", f"/v1/projects/{OTHER}?confirm=true", headers=AH)
+check("delete project (with its configs)", 200, "DELETE", f"/v1/projects/{P_ID}?confirm=true", headers=AH)
+check("deleted project -> 404", 404, "GET", f"/v1/projects/{P_ID}", headers=AH)
 NEW = requests.post(f"{BASE}/v1/admin/providers/{A_ID}/keys", headers={**SUH, **JSON},
                     json={"label": "rotated"}).json()["api_key"]
 check("revoke old key", 200, "DELETE", f"/v1/admin/providers/{A_ID}/keys/{A_KID}", headers=SUH)
@@ -2417,19 +2823,21 @@ Tick each box as you verify it. **Section** points back to the details above.
 - [ ] Provider key gets 403 on every `/v1/admin/*` route (§4.8)
 - [ ] Only a SHA-256 of keys is stored (§4.9)
 
-#### Configs
+#### Projects & configs
 
+- [ ] **Projects:** create (`created` true/false with `?on_exists=reuse`), duplicate → 409, name rules, list scopes, detail, PATCH rename/describe/share, delete needs `confirm` and takes its configs with it (§5.0, §5.13)
+- [ ] Config names are unique **per project**; the same name works in two projects; refs and refresh stop at the project boundary (§5.9, §15.3)
 - [ ] Validate dry-run saves nothing (§5.4)
-- [ ] Publish via **YAML** body, via **JSON** body, and as superuser for a provider (§5.5, 5.12)
+- [ ] Publish into a project via **YAML** body and **JSON** body; superuser creates a project for a provider (§5.5, 5.12)
 - [ ] List scopes `mine` / `shared` / `all`; `can_write` flag (§5.6)
-- [ ] PATCH: merge schedule/failure/seed; toggle `is_only_me`; replace `fields` with confirm (§5.7)
+- [ ] PATCH: merge schedule/failure/seed; replace `fields` with confirm; `is_only_me` on a config is refused with a pointer to the project (§5.7)
 - [ ] PATCH negatives; built-in configs → `managed_by_yaml` (§5.7)
 - [ ] Delete needs `confirm=true`; frees name and quota slot (§5.8)
 - [ ] Parent/child rules: missing parent rows, `has_dependents`, cycles (§5.9)
 - [ ] Whole bad-config gauntlet returns clear 422s and creates nothing (§5.10)
 - [ ] Body problems: bad JSON, non-object, anchors, > 64 KB → 413 (§5.10)
-- [ ] Quotas enforced (§5.11)
-- [ ] Built-in YAML: add `configs/<name>.yaml`, restart, it appears as `cfg_sys_<name>` (§5.3-A)
+- [ ] Quotas enforced: projects per provider, configs per project, configs per provider (§5.11)
+- [ ] Built-in YAML: add `configs/<name>.yaml`, restart, it appears as `cfg_sys_<name>` inside the read-only `examples` project (§5.3-A)
 
 #### Rows (CRUD)
 
@@ -2460,15 +2868,18 @@ Tick each box as you verify it. **Section** points back to the details above.
 - [ ] Snapshot CSV / NDJSON / SQL (sqlite + postgresql); headers; file names (§12.1)
 - [ ] Delta export + `X-From/To-Cursor`; delta errors (§12.2)
 - [ ] Zip bundle loads into SQLite with FKs on; mixed snapshot + delta bundle (§12.3)
-- [ ] Bundle error cases (§12.3)
+- [ ] Bundle error cases, including `mixed_projects` (§12.3)
+- [ ] **Whole-project zip** (`/v1/projects/{id}/export`): manifest names the project; postgres `schema.sql` has `SET search_path`; empty project → 409 (§12.3)
 - [ ] DDL: parents first, `include_parents=false`, postgres dialect, no internal names (§13)
+- [ ] **Project DDL**: the whole schema, `CREATE SCHEMA` on postgres, runs on SQLite with FKs (§13)
+- [ ] **Project batch**: needs `confirm`, parents first, same seed ⇒ same rows, other projects untouched, row caps checked up front (§8.6)
 
 #### Isolation & superuser
 
-- [ ] Bob: public config → reads 200 / writes 403 on every route (§15.1)
-- [ ] Private config → 404 everywhere for Bob; owner + superuser unaffected (§15.2)
-- [ ] Same config name for two providers; no cross-provider refs (§15.3)
-- [ ] Built-ins readable by providers, writable only by superuser (§15.4)
+- [ ] Bob: public project/config → reads 200 / writes 403 on every route, config and project (§15.1)
+- [ ] Private **project** → 404 everywhere for Bob, for the project routes *and* every config in it; owner + superuser unaffected (§15.2)
+- [ ] Same config name for two providers (and for two projects of one provider); no cross-provider and no cross-project refs (§15.3)
+- [ ] Built-ins readable by providers, writable only by superuser; the `examples` project takes no new configs (§15.4)
 - [ ] Superuser can read/write/patch anything (§15.5)
 - [ ] Deactivated provider: keys dead, public configs still served (§15.6)
 - [ ] Every legacy route → 403 for provider keys (§16.5)
@@ -2477,15 +2888,16 @@ Tick each box as you verify it. **Section** points back to the details above.
 #### CLI, ops
 
 - [ ] All CLI commands incl. `--yes` guard and exit codes (§17)
-- [ ] Restart persistence (§19.2); PostgreSQL run (§19.3); Docker run (§19.4)
-- [ ] `pytest -v` → 310 passing (§19.5)
+- [ ] Restart persistence incl. a private project (§19.2); upgrade of a pre-projects database (§19.2); PostgreSQL run (§19.3); Docker run (§19.4)
+- [ ] `pytest -v` → 355 passing, with `configs/` untouched by any test (§19.5)
 - [ ] `smoke_test.py` → ALL CHECKS PASSED (§20)
 
 #### Idempotent re-run
 
-- [ ] Running §0 → §16 a second time creates no new provider, no new active key and no new config; no step fails with `409 already_exists` (§0.2)
+- [ ] Running §0 → §16 a second time creates no new provider, no new active key, no new project and no new config; no step fails with `409 already_exists` (§0.2)
 - [ ] `baseline_data(KEY, CID, seed=42)` twice gives identical ids (§6, §0.2)
-- [ ] `teardown()` leaves no guide config behind, and calling it again does nothing (§0.2)
+- [ ] `teardown()` leaves no guide project (or config) behind, and calling it again does nothing (§0.2)
+- [ ] `ensure_project` twice → `created` then `reused`, the same id, description untouched (§5.0)
 - [ ] `smoke_test.py` passes twice in a row (§20)
 
 ---
@@ -2502,8 +2914,20 @@ Tick each box as you verify it. **Section** points back to the details above.
 - **Readers share the owner's `failure_injection`.**
 - **The change log is never trimmed** except by `reset` or deleting the config.
 - **No rate limiting on failed auth attempts; one superuser role with no audit trail.** Put the API behind HTTPS — a header key is readable on plain HTTP.
-- **No migrations** (`create_all` only) and **no cron-expression cadences**; `drift` injection is not implemented.
+- **No migration framework** (`create_all`, plus one idempotent step that upgrades a pre-projects database) and **no cron-expression cadences**; `drift` injection is not implemented.
 - **`version` = `max(version)+1`** — safe with the serialised writers here, not with concurrent ones.
+
+**About projects**
+
+- **A project is a scope, not a prefix.** Tables are still `d_<10 hex>_<name>`; the project decides which configs can `ref` each other, what a bulk refresh reaches, what a bundle may mix, and what a DDL/zip export contains.
+- **Visibility is per project.** There is no per-config `is_only_me` (a config body or PATCH with it is rejected) — otherwise a shared table could point at a hidden parent.
+- **`ref` cannot cross projects**, even between two of your own. To reuse a parent, publish a copy of it in the second project.
+- **Deleting a project deletes everything in it** (configs, rows, change history, jobs), children first — behind `?confirm=true`. Quota slots come back immediately.
+- **`?on_exists=reuse` never edits.** An existing project keeps its description and visibility; use `PATCH` on purpose.
+- **Real PostgreSQL schemas appear only in exports.** The running server does not create a database schema (SQLite has none); `…/ddl?dialect=postgresql` and the zip's `schema.sql` start with `CREATE SCHEMA` + `SET search_path`, and the zip's data files expect that search path.
+- **The built-in `examples` project is read-only** — `409 managed_by_yaml` on rename, delete or publishing into it; only its `is_only_me` can be changed (superuser).
+- **`POST /v1/configs` is gone** — configs are published into a project (`POST /v1/projects/{id}/configs`). Everything addressed by config id is unchanged.
+- **Upgrading an old database files every provider's configs into a `default` project**, private if any of them was. It was exercised on SQLite; try it on a copy of a PostgreSQL database first.
 
 **From reading the code (not called out in the README)**
 
@@ -2523,8 +2947,8 @@ Tick each box as you verify it. **Section** points back to the details above.
 **From making the guide re-runnable**
 
 - **A provider's secret is shown once.** `ensure_provider` keeps it in `.synthetic_state.json`; delete that file and the next run issues exactly one new key (it never creates a second provider).
-- **Providers cannot be deleted** (no route) — only deactivated. That is why the guide reuses them by name instead of creating fresh ones.
-- **`ensure_config` never edits or re-seeds an existing config.** Changing a config's `fields` is destructive and stays an explicit step (§5.7, `?confirm=true`).
+- **Providers cannot be deleted** (no route) — only deactivated. That is why the guide reuses them by name instead of creating fresh ones. Their **projects can** be deleted, which is how `teardown()` resets the guide.
+- **`ensure_project` never edits an existing project, and `ensure_config` never edits or re-seeds an existing config.** Changing a config's `fields` is destructive and stays an explicit step (§5.7, `?confirm=true`).
 - **A caller cannot choose a primary key**, so `ensure_row` uses a field you control as the row's identity. Rows with random ids are only made repeatable with `baseline_data` (replace + seed).
 - **The same seed twice is a `409 duplicate_primary_key`**, not a silent duplicate — treat it as "already done".
 - **Soft-deleted rows stay in the table and the change log.** Steps that create-then-delete a probe row leave the live data unchanged, but `row_count` and the feed still grow by that row.
