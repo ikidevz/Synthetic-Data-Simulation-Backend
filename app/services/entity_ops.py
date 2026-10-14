@@ -18,16 +18,17 @@ from __future__ import annotations
 import random
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.engine import Connection, Engine
 
 from ..config.entities import EntityConfig, FieldConfig
 from ..core.errors import ApiError
+from ..db import models
 from .changefeed import log_change
 from .generator import generate_row
-from .scheduler import _existing_ids, _next_version
+from .scheduler import WRITE_LOCK, _existing_ids, _next_version
 
 
 def maybe_inject_failure(cfg: EntityConfig) -> None:
@@ -157,6 +158,71 @@ def create_row(
         log_change(conn, cfg.entity,
                    row[cfg.primary_key_field], "insert", row["version"])
     return row_to_dict(row)
+
+
+MAX_BULK_ROWS = 100_000
+BULK_LOCK_TIMEOUT = 30.0
+
+
+def create_rows_bulk(
+    engine: Engine, cfg: EntityConfig, table: Any, tables: Dict[str, Any],
+    configs: Dict[str, EntityConfig], payloads: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Insert many rows in ONE transaction: all are stored, or none are.
+
+    Each payload is validated like POST /data (strict). A bad row aborts the whole
+    request and the error message names its position, e.g. `rows[3]: ...`.
+    """
+    maybe_inject_failure(cfg)
+    needed = {cfg.entity} | {
+        f.ref_entity for f in cfg.fields.values() if f.type == "ref"}
+    pk_field = cfg.primary_key_field
+
+    if not WRITE_LOCK.acquire(timeout=BULK_LOCK_TIMEOUT):
+        raise ApiError(
+            "busy", "another bulk write is in progress; try again shortly", 409)
+    try:
+        with engine.begin() as conn:
+            if cfg.max_rows is not None:
+                total = conn.execute(
+                    select(func.count()).select_from(table)).scalar() or 0
+                if total + len(payloads) > cfg.max_rows:
+                    raise ApiError(
+                        "quota_exceeded",
+                        f"that would leave {total + len(payloads)} rows; "
+                        f"a config may hold at most {cfg.max_rows}", 422)
+
+            ids = _existing_ids(conn, tables, configs, needed)
+            # last version already used
+            version = _next_version(conn, table) - 1
+            now = datetime.now(timezone.utc)
+            rows: List[Dict[str, Any]] = []
+            logs: List[Dict[str, Any]] = []
+            for i, payload in enumerate(payloads):
+                try:
+                    values = check_payload(conn, cfg, tables, payload)
+                except ApiError as exc:
+                    raise ApiError(exc.code, f"rows[{i}]: {exc.message}",
+                                   exc.status) from exc
+                row = generate_row(cfg, ids)
+                row.update(values)
+                version += 1
+                row["version"] = version
+                rows.append(row)
+                logs.append({"entity": cfg.entity, "pk_value": str(row[pk_field]),
+                             "op": "insert", "version": version, "changed_at": now})
+                ids.setdefault(cfg.entity, []).append(row[pk_field])
+            conn.execute(insert(table), rows)
+            conn.execute(insert(models.change_log), logs)
+    finally:
+        WRITE_LOCK.release()
+
+    return {
+        "inserted": len(rows),
+        "first_version": rows[0]["version"],
+        "last_version": rows[-1]["version"],
+        "items": [row_to_dict(r) for r in rows],
+    }
 
 
 def update_row(

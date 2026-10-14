@@ -85,6 +85,10 @@ class KeyCreate(BaseModel):
     label: Optional[str] = None
 
 
+class BulkCreateRequest(BaseModel):
+    rows: Optional[List[Dict[str, Any]]] = None
+
+
 _SHOWN_ONCE = "Store this key now: it is shown once, and only a hash of it is kept."
 
 
@@ -414,6 +418,26 @@ def create_data(config_id: str, payload: Optional[Dict[str, Any]] = Body(default
     tables, configs, labels = _write_scope(entry)
     try:
         return entity_ops.create_row(engine, entry.cfg, entry.table, tables, configs, payload, entry.name, strict=True)
+    except MissingReferenceError as exc:
+        raise ApiError("missing_parent_rows", scrub(str(exc), labels), 409)
+
+
+@router.post("/configs/{config_id}/data/bulk", status_code=201)
+def create_data_bulk(config_id: str, req: BulkCreateRequest,
+                     principal: Principal = Depends(current_principal)):
+    """Add many rows at once, atomically. Body: `{"rows": [{...}, {}, ...]}`; `{}` is a
+    fully generated row. Same validation as POST /data; one bad row rejects the lot."""
+    entry = catalog.resolve(config_id, principal, "write")
+    rows = req.rows
+    if not rows:
+        raise ApiError("invalid_request",
+                       "`rows` must be a non-empty list of objects ({} = a generated row)", 422)
+    if len(rows) > entity_ops.MAX_BULK_ROWS:
+        raise ApiError("too_many_rows",
+                       f"at most {entity_ops.MAX_BULK_ROWS} rows per request; got {len(rows)}", 422)
+    tables, configs, labels = _write_scope(entry)
+    try:
+        return entity_ops.create_rows_bulk(engine, entry.cfg, entry.table, tables, configs, rows)
     except MissingReferenceError as exc:
         raise ApiError("missing_parent_rows", scrub(str(exc), labels), 409)
 

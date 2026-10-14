@@ -53,6 +53,8 @@ WRITES = [
      "/v1/configs/{id}", {"failure_injection": {"latency_ms": 0}}, 200),
     ("delete config (unconfirmed)", "DELETE", "/v1/configs/{id}", None, 400),
     ("create row", "POST", "/v1/configs/{id}/data", {}, 201),
+    ("bulk create rows", "POST",
+     "/v1/configs/{id}/data/bulk", {"rows": [{}]}, 201),
     ("update row", "PUT",
      "/v1/configs/{id}/data/{row}", {"name": "Renamed"}, 200),
     ("batch", "POST", "/v1/configs/{id}/batch",
