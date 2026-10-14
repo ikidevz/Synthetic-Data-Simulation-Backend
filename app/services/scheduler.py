@@ -219,6 +219,9 @@ def schedule_entity(
 ) -> None:
     """(Re)register one entity's job on the entity's configured cadence."""
     cfg = configs[name]
+    if not cfg.update_schedule.is_active:
+        unschedule_entity(scheduler, name)
+        return
     scheduler.add_job(
         run_entity_job,
         trigger=IntervalTrigger(

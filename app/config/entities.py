@@ -50,10 +50,19 @@ class FieldConfig(BaseModel):
 
 class UpdateScheduleConfig(BaseModel):
     cadence: str = "hourly"
-    new_records: List[int] = [5, 15]
-    mutate_existing_pct: float = 5.0
-    soft_delete_pct: float = 1.0
+    new_records: List[int] = [0, 0]
+    mutate_existing_pct: float = 0.0
+    soft_delete_pct: float = 0.0
     jitter_seconds: int = 0
+
+    @property
+    def is_active(self) -> bool:
+        """True only if a tick would actually change something."""
+        return (
+            self.new_records[1] > 0
+            or self.mutate_existing_pct > 0
+            or self.soft_delete_pct > 0
+        )
 
     @field_validator("cadence")
     @classmethod
